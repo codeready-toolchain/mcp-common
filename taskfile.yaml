@@ -1,0 +1,12 @@
+version: '3'
+
+tasks:
+  test:
+    cmds:
+      # The idiomatic way to disable test caching explicitly is to use -count=1
+      - go test ./pkg/... -count=1 -v --failfast
+
+  lint:
+    cmds:
+      - curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $GOPATH/bin
+      - $GOPATH/bin/golangci-lint run -v -c .golangci.yml ./...

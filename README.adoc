@@ -1,0 +1,59 @@
+= MCP Common
+
+Shared Go library providing Prometheus metrics, logging/metrics middleware, and version injection for codeready-toolchain MCP servers.
+
+== Packages
+
+=== `pkg/metrics`
+
+Prometheus metric definitions shared across all MCP servers:
+
+- `MCPCallsTotal` -- CounterVec tracking total MCP calls by `server`, `method`, `name`, `success`
+- `MCPCallDuration` -- HistogramVec tracking MCP call duration in seconds
+
+=== `pkg/middleware`
+
+MCP server middleware using `*slog.Logger`:
+
+- `NewMetricsMiddleware(serverName string, logger *slog.Logger) mcp.Middleware` -- records Prometheus metrics for every MCP call
+- `NewLoggingMiddleware(logger *slog.Logger) mcp.Middleware` -- logs MCP method start/completion/failure with session ID and duration
+
+=== `pkg/version`
+
+Build-time version info injected via ldflags:
+
+- `Commit` -- git commit hash
+- `BuildTime` -- binary build timestamp
+
+Inject at build time:
+```
+go build -ldflags "-X github.com/codeready-toolchain/mcp-common/pkg/version.Commit=$(git rev-parse HEAD) -X github.com/codeready-toolchain/mcp-common/pkg/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+== Usage
+
+```go
+import (
+    "github.com/codeready-toolchain/mcp-common/pkg/metrics"
+    "github.com/codeready-toolchain/mcp-common/pkg/middleware"
+    "github.com/codeready-toolchain/mcp-common/pkg/version"
+)
+```
+
+== Build
+
+Requires Go version 1.24.x (1.24.13 or higher) -- download for your development environment https://golang.org/dl/[here].
+
+This repository uses https://github.com/golang/go/wiki/Modules[Go modules].
+
+== Test
+
+```
+task test
+```
+
+== Lint
+
+```
+task lint
+```
