@@ -6,403 +6,564 @@
 
 ## Overview
 
-A standalone Go MCP server that exposes bundled CLI tools as per-CLI `execute_<name>` MCP tools. **Initial scope: `oc` and `kubectl` only.** The architecture is config-driven and extensible to additional CLIs (e.g., `virtctl`, `helm`) in the future without code changes.
+A Go MCP server that provides TARSy investigation agents with a **sandboxed execution environment** — a per-investigation Kubernetes pod where the LLM has a persistent bash shell with full CLI access. The server exposes two MCP tools — `shell_exec` (command execution) and `session_end` (cleanup) — manages sandbox pod lifecycle via `client-go`, and proxies commands to a lightweight agent binary running inside each pod.
 
-The server targets a **multi-cluster** environment. The LLM specifies the target cluster by name; the server resolves the corresponding kubeconfig and context, validates the command against per-CLI security rules, executes via `exec.Command`, and returns the output.
+The server runs in **stateless mode** (`--stateless`), consistent with all other MCP servers. Session routing uses an explicit `session_id` parameter in every tool call, with Kubernetes pod labels as the source of truth. Any MCP server replica can serve any request — no sticky sessions, no shared state.
+
+**Initial scope:** `oc`, `kubectl`, and standard Unix utilities (`jq`, `yq`, `grep`, `awk`, `curl`). The sandbox image is extensible to additional CLIs by installing binaries — no server code changes.
 
 ## Design Principles
 
-1. **Config-driven, code-stable** — adding a new CLI requires a Dockerfile change and a config entry, never a code change to the MCP server itself.
-2. **Defense-in-depth** — RBAC is the hard boundary; application-level filtering, no-shell execution, container isolation, and output controls are layered on top.
-3. **Consistent with the ecosystem** — follows `mcp-server-devsandbox` patterns for middleware, deployment, and testing. Entry point convention is `cmd/main.go` (vs `sandbox/main.go` in devsandbox — functionally equivalent, `cmd/` is standard Go).
-4. **Simple tool schema** — `command` string + `cluster` name + optional `timeout` per CLI. LLMs write commands naturally.
-5. **Stateless HTTP** — multi-replica deployment behind kube-rbac-proxy, same as all existing MCP servers.
-6. **Multi-cluster native** — discovers available clusters from a shared kubeconfig at startup, same kubeconfig as `mcp-server-devsandbox`.
+1. **Stateless server, stateful sandbox** — the MCP server is stateless (any replica, any request). All session state lives in the sandbox pod's persistent bash process and ephemeral filesystem.
+2. **Sandbox as security boundary** — no application-level command filtering. Security comes from RBAC, pod isolation, network isolation, and ephemeral storage.
+3. **Dumb proxy** — the MCP server's job is pod lifecycle management and command proxying. It doesn't parse, validate, or transform shell commands.
+4. **Consistent with the ecosystem** — follows `mcp-server-devsandbox` patterns for middleware, deployment, stateless mode, and testing.
+5. **Two simple binaries** — the MCP server (control plane) and the sandbox agent (data plane) are separate binaries in the same repo, each with a focused responsibility.
 
 ## Architecture
 
 ### Component diagram
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Pod: cli-mcp-server                                                 │
-│                                                                      │
-│  ┌─────────────────┐     ┌─────────────────────────────────────────┐ │
-│  │ kube-rbac-proxy  │     │ cli-mcp-server (main container)        │ │
-│  │                  │     │                                         │ │
-│  │  TLS :8443 ──────┼────▶│  :8080                                 │ │
-│  │  TokenReview     │     │                                         │ │
-│  │  Bearer auth     │     │  ┌──────────┐  ┌────────────────────┐  │ │
-│  │                  │     │  │ MCP SDK  │  │ CLI Registry       │  │ │
-│  │                  │     │  │ Server   │  │                    │  │ │
-│  └─────────────────┘     │  │          │  │ oc ──▶ executor    │  │ │
-│                           │  │ /mcp     │──▶ kubectl ──▶ exec  │  │ │
-│                           │  │ /metrics │  │                    │  │ │
-│                           │  │ /live    │  │ Cluster Registry   │  │ │
-│                           │  │ /health  │  │ rm1 ──▶ kubeconfig │  │ │
-│                           │  │          │  │ rm2 ──▶ kubeconfig │  │ │
-│                           │  └──────────┘  └────────────────────┘  │ │
-│                           │                        │                │ │
-│                           │                        ▼                │ │
-│                           │              ┌──────────────────┐      │ │
-│                           │              │ Security Filter  │      │ │
-│                           │              │ (allowlist +     │      │ │
-│                           │              │  blocklist)      │      │ │
-│                           │              └────────┬─────────┘      │ │
-│                           │                       ▼                 │ │
-│                           │              exec.Command(binary, args) │ │
-│                           │                       │                 │ │
-│                           └───────────────────────┼─────────────────┘ │
-│                                                   ▼                   │
-│                                          kubeconfig (ro mount)        │
-│                                                   │                   │
-└───────────────────────────────────────────────────┼───────────────────┘
-                                                    ▼
-                                           Target K8s clusters
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Pod: cli-mcp-server (Deployment, N replicas)                          │
+│                                                                         │
+│  ┌─────────────────┐     ┌────────────────────────────────────────────┐ │
+│  │ kube-rbac-proxy  │     │ cli-mcp-server (main container)           │ │
+│  │                  │     │                                            │ │
+│  │  TLS :8443 ──────┼────▶│  :8080                                    │ │
+│  │  TokenReview     │     │                                            │ │
+│  │  Bearer auth     │     │  ┌──────────┐  ┌───────────────────────┐  │ │
+│  │                  │     │  │ MCP SDK  │  │ Session Manager       │  │ │
+│  │                  │     │  │ Server   │  │                       │  │ │
+│  └─────────────────┘     │  │          │  │ Create pod (client-go)│  │ │
+│                           │  │ /mcp     │──▶ Discover by label     │  │ │
+│                           │  │ /metrics │  │ Proxy to agent HTTP   │  │ │
+│                           │  │ /live    │  │ Cleanup on end/TTL    │  │ │
+│                           │  │ /health  │  │                       │  │ │
+│                           │  └──────────┘  └───────────────────────┘  │ │
+│                           │                        │                   │ │
+│                           └────────────────────────┼───────────────────┘ │
+│                                                    │                     │
+└────────────────────────────────────────────────────┼─────────────────────┘
+                                                     │ HTTP (pod IP:8090)
+                                                     ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  Pod: cli-mcp-sandbox-<session-id> (one per investigation)             │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │ sandbox-agent (Go binary, HTTP :8090)                           │    │
+│  │                                                                  │    │
+│  │  POST /exec   → pipe command to persistent bash, return result  │    │
+│  │  GET  /health → readiness check                                  │    │
+│  │                                                                  │    │
+│  │  Persistent bash process (stdin/stdout/stderr pipes)             │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  CLIs: oc, kubectl          Unix: jq, yq, grep, awk, curl              │
+│  /config/kubeconfig (ro)    /workspace/ (emptyDir, writable)            │
+│                                                                         │
+│  Labels: tarsy.redhat.com/session-id=<id>                               │
+│          tarsy.redhat.com/component=cli-mcp-sandbox                     │
+│                                                                         │
+│  NetworkPolicy: ingress from cli-mcp-server only                        │
+│                 egress to K8s API servers only                           │
+└─────────────────────────────────────────────────────────────────────────┘
+                     │
+                     ▼
+            Target K8s clusters (via read-only kubeconfig)
 ```
 
 ### Request flow
 
-1. TARSy sends `tools/call` with tool name `execute_oc` and params `{"command": "get pods -n foo -o json", "cluster": "rm1"}`
+1. TARSy sends `tools/call` with tool `shell_exec` and params `{"command": "oc get pods -n foo --context=rm1", "session_id": "inv-abc123"}`
 2. kube-rbac-proxy validates the bearer token via TokenReview, forwards to `:8080`
-3. MCP SDK dispatches to the registered handler for `execute_oc`
-4. Handler parses the command string via `strings.Fields()`
-5. **Security filter** checks: first token against CLI's `allowed_verbs`, full command against `blocked_patterns`
-6. Handler resolves `cluster` → kubeconfig path + context from the cluster registry, injects `--kubeconfig` and `--context` flags
-7. Handler calls `CommandExecutor.Execute()` with timeout context
-8. Output is captured (stdout + stderr), truncated if needed
-9. Result returned as `mcp.CallToolResult` with the CLI output as text content
+3. MCP SDK dispatches to the registered `shell_exec` handler
+4. Session manager looks up pod by label `tarsy.redhat.com/session-id=inv-abc123`
+   - **Cache hit:** use cached pod IP
+   - **Cache miss:** query K8s API for pods with that label. If found, cache and use. If not found, create new sandbox pod, wait for ready, cache pod IP.
+5. HTTP POST to `http://<pod-ip>:8090/exec` with `{"command": "oc get pods -n foo --context=rm1", "timeout": 60}`
+6. Sandbox agent pipes command to persistent bash, captures stdout/stderr, returns JSON response
+7. MCP server truncates output if needed (100KB limit), returns `mcp.CallToolResult` to TARSy
 
 ## Core Concepts
 
-### CLI configuration (`config.yaml`)
+### Session management
 
-The config uses a **list** of CLIs (preserves registration order, consistent with `mcp-server-devsandbox` toolsets).
+The MCP server runs in **stateless mode** (`Stateless: true` in `StreamableHTTPOptions`), consistent with all other MCP servers (`mcp-server-devsandbox`, `kubernetes-mcp-server`, etc.). This enables multi-replica deployment behind a load balancer with no sticky sessions.
 
-```yaml
-defaults:
-  timeout: 60
-  max_timeout: 300
-  max_output_bytes: 102400  # 100KB
+Session identification uses an **explicit `session_id` parameter** in every `shell_exec` call. The calling agent (TARSy) passes its investigation ID as the `session_id`. This keeps the MCP server truly stateless — it doesn't track sessions at the transport layer, and any replica can serve any request by looking up the pod via Kubernetes labels.
 
-clis:
-  - name: oc
-    path: /usr/bin/oc
-    description: |
-      Execute OpenShift CLI (oc) commands for cluster investigation.
-      Use for: OpenShift-specific resources (Routes, DeploymentConfigs, ClusterOperators,
-      MachineConfigs), oc adm commands, and any standard K8s operations on OpenShift clusters.
-      Read-only: only investigation commands are allowed.
-    security:
-      allowed_verbs:
-        - get
-        - describe
-        - logs
-        - status
-        - adm
-        - explain
-        - api-resources
-        - api-versions
-        - whoami
-        - version
-      blocked_patterns:
-        - "adm drain"
-        - "adm cordon"
-        - "adm uncordon"
-        - "adm taint"
-        - "adm migrate"
-        - "adm must-gather"
+**Why explicit parameter instead of SDK session ID:** The MCP SDK's stateful mode tracks sessions in memory, requiring sticky sessions or shared state for multi-replica deployments. Since all other MCP servers run stateless, and the sketch mandates "pod labels are the source of truth," an explicit parameter is the natural fit. It's also more debuggable — the session routing is visible in every tool call, not hidden in transport headers.
 
-  - name: kubectl
-    path: /usr/bin/kubectl
-    description: |
-      Execute kubectl commands for Kubernetes resource investigation.
-      Use for: standard Kubernetes resources. Prefer execute_oc on OpenShift clusters.
-    security:
-      allowed_verbs:
-        - get
-        - describe
-        - logs
-        - top
-        - explain
-        - api-resources
-        - api-versions
-        - version
-      blocked_patterns: []
-```
+### MCP tool: `shell_exec`
 
-> **Extensibility:** Adding a future CLI (e.g., `virtctl`, `helm`) requires only a new entry here and a binary in the Dockerfile. The `CLIConfig` struct also supports optional `env` (per-CLI environment variables) for CLIs that need them. No code changes.
-
-### Go types
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `command` | string | yes | Shell command to execute (full bash — pipes, redirects, chaining) |
+| `session_id` | string | yes | Session identifier (typically the TARSy investigation ID) |
+| `timeout` | int | no | Max execution time in seconds (default 60, max 300) |
 
 ```go
-type Config struct {
-    Defaults DefaultsConfig `yaml:"defaults"`
-    CLIs     []CLIConfig    `yaml:"clis"`
-}
-
-type DefaultsConfig struct {
-    Timeout        int `yaml:"timeout"`
-    MaxTimeout     int `yaml:"max_timeout"`
-    MaxOutputBytes int `yaml:"max_output_bytes"`
-}
-
-type CLIConfig struct {
-    Name     string            `yaml:"name"`
-    Path     string            `yaml:"path"`
-    Description string         `yaml:"description"`
-    Env      map[string]string `yaml:"env,omitempty"`
-    Security SecurityConfig    `yaml:"security"`
-}
-
-type SecurityConfig struct {
-    AllowedVerbs    []string `yaml:"allowed_verbs"`
-    BlockedPatterns []string `yaml:"blocked_patterns"`
+type ShellExecInput struct {
+    Command   string `json:"command" jsonschema:"required,description=Shell command to execute (full bash — pipes, redirects, chaining supported)"`
+    SessionID string `json:"session_id" jsonschema:"required,description=Session identifier for sandbox pod routing (typically the investigation ID)"`
+    Timeout   *int   `json:"timeout,omitempty" jsonschema:"description=Max execution time in seconds (default 60, max 300)"`
 }
 ```
 
-### Multi-cluster support
+Example calls (TARSy investigation `inv-abc123`):
 
-The server discovers available clusters from a shared kubeconfig file at startup, following the same multi-cluster pattern as `mcp-server-devsandbox`. Each cluster maps to a kubeconfig path and context name.
+```
+shell_exec(command="oc get clusteroperators --context=rm1", session_id="inv-abc123")
+shell_exec(command="oc get pods -n openshift-ingress --context=rm1 -o json | jq '.items[] | {name: .metadata.name, ready: .status.containerStatuses[0].ready}'", session_id="inv-abc123")
+shell_exec(command="diff <(oc get pods --context=rm1 -o name) <(oc get pods --context=rm2 -o name)", session_id="inv-abc123")
+```
+
+Working directory and environment variables persist between calls within the same session — maintained by the persistent bash process in the sandbox agent.
+
+### Session manager
+
+The component inside `cli-mcp-server` that manages sandbox pod lifecycle. It operates statelessly — all durable state is in Kubernetes labels.
 
 ```go
-type ClusterInfo struct {
-    Name           string
-    KubeconfigPath string
-    Context        string
+type SessionManager struct {
+    clientset  kubernetes.Interface
+    namespace  string
+    config     SandboxConfig
+    cache      *PodCache
+    logger     *slog.Logger
 }
 
-type ClusterRegistry struct {
-    clusters map[string]ClusterInfo
+type SandboxConfig struct {
+    Image          string        // sandbox agent container image
+    CPURequest     string        // default: "100m"
+    CPULimit       string        // default: "500m"
+    MemoryRequest  string        // default: "128Mi"
+    MemoryLimit    string        // default: "512Mi"
+    IdleTimeout    time.Duration // default: 30m
+    KubeconfigPath string        // path to kubeconfig secret for sandbox pods
+}
+```
+
+**Operations:**
+
+1. **GetOrCreatePod(sessionID)** — looks up pod by label, creates if missing
+   - Label query: `tarsy.redhat.com/session-id=<sessionID>,tarsy.redhat.com/component=cli-mcp-sandbox`
+   - On create: generates pod spec, creates via `client-go`, waits for `PodRunning` + agent `/health` 200
+   - Returns pod IP for agent communication
+   - Caches result in `PodCache` (TTL ~30s) to avoid per-request K8s API calls
+
+2. **ExecuteCommand(sessionID, command, timeout)** — resolves pod, sends HTTP POST to agent
+   - Calls `GetOrCreatePod` for the pod IP
+   - HTTP POST to `http://<pod-ip>:8090/exec`
+   - Updates `tarsy.redhat.com/last-activity` annotation on the pod (patch via `client-go`)
+   - Returns structured response (stdout, stderr, exit code, duration)
+   - Truncates output at 100KB at the MCP server level
+
+3. **CleanupSession(sessionID)** — deletes the sandbox pod
+   - Called when session ends (via `session_end` tool or TTL expiry)
+   - Deletes pod by label selector
+
+4. **CleanupStale()** — periodic goroutine that deletes pods past TTL
+   - Runs every 5 minutes
+   - Lists all sandbox pods, checks `tarsy.redhat.com/last-activity` annotation
+   - Deletes pods idle beyond `IdleTimeout`
+
+**Pod cache:**
+
+```go
+type PodCache struct {
+    mu      sync.RWMutex
+    entries map[string]*PodCacheEntry
+    ttl     time.Duration // ~30s
 }
 
-func (r *ClusterRegistry) Resolve(clusterName string) (ClusterInfo, error) {
-    info, ok := r.clusters[clusterName]
-    if !ok {
-        return ClusterInfo{}, fmt.Errorf("unknown cluster %q; available: %s",
-            clusterName, strings.Join(r.ClusterNames(), ", "))
+type PodCacheEntry struct {
+    podName   string
+    podIP     string
+    cachedAt  time.Time
+}
+```
+
+On MCP server restart, the cache is empty. The first request for each active session triggers a label query, which rediscovers the existing pod and repopulates the cache. No session data is lost because the sandbox pod (and its persistent bash process) is still running.
+
+### Sandbox agent
+
+The lightweight Go binary running inside each sandbox pod. ~200-300 lines of Go.
+
+**API:**
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/exec` | POST | Execute a command in the persistent bash session |
+| `/health` | GET | Readiness check (returns 200 if bash process is alive) |
+
+**Request/response:**
+
+```go
+type ExecRequest struct {
+    Command string `json:"command"`
+    Timeout int    `json:"timeout,omitempty"` // seconds, default 60
+}
+
+type ExecResponse struct {
+    Stdout     string `json:"stdout"`
+    Stderr     string `json:"stderr"`
+    ExitCode   int    `json:"exit_code"`
+    DurationMs int64  `json:"duration_ms"`
+}
+```
+
+**Persistent bash session (pipe-based with delimiter protocol):**
+
+The agent manages a persistent `bash --norc --noprofile` process using Go's `os/exec` with `StdinPipe()`, `StdoutPipe()`, and `StderrPipe()`. No external dependencies — pure Go stdlib. This approach gives clean stdout/stderr separation (important for structured responses) and avoids PTY complexity that adds no value for LLM consumption.
+
+```go
+type BashSession struct {
+    cmd    *exec.Cmd
+    stdin  io.WriteCloser
+    stdout *bufio.Reader
+    stderr *bufio.Reader
+    mu     sync.Mutex
+}
+
+func NewBashSession() (*BashSession, error) {
+    cmd := exec.Command("bash", "--norc", "--noprofile")
+    cmd.Env = append(os.Environ(), "PS1=", "PS2=")
+    stdin, _ := cmd.StdinPipe()
+    stdout, _ := cmd.StdoutPipe()
+    stderr, _ := cmd.StderrPipe()
+    if err := cmd.Start(); err != nil {
+        return nil, err
     }
-    return info, nil
+    return &BashSession{
+        cmd:    cmd,
+        stdin:  stdin,
+        stdout: bufio.NewReader(stdout),
+        stderr: bufio.NewReader(stderr),
+    }, nil
 }
-
-func (r *ClusterRegistry) ClusterNames() []string { /* sorted keys */ }
 ```
 
-At startup, the server:
-1. Reads the kubeconfig file (path from `--kubeconfig` flag)
-2. Splits it into per-cluster kubeconfigs (same approach as `mcp-server-devsandbox`'s `SplitToKubeConfigs`)
-3. Builds the `ClusterRegistry` mapping cluster names to kubeconfig paths and contexts
-4. Makes available cluster names visible in tool descriptions and server instructions
-
-### CLI registry and tool registration
-
-At startup, the server:
-
-1. Reads the config file (path from `--config` flag, default `/etc/cli-mcp-server/config.yaml`)
-2. For each CLI entry, checks if the binary exists at `path` via `exec.LookPath` or `os.Stat`
-3. For CLIs with binaries found, creates a `CLITool` and registers it with the MCP server
-4. Logs which CLIs were registered and which were skipped (binary not found)
+**Delimiter protocol:** Each command execution wraps the user's command with unique delimiters to isolate its output from the continuous stream. A UUID-based delimiter per request avoids collisions with command output.
 
 ```go
-type CLITool struct {
-    config   CLIConfig
-    defaults DefaultsConfig
-    clusters *ClusterRegistry
-    executor CommandExecutor
-    logger   *slog.Logger
+func (b *BashSession) Execute(command string, timeout time.Duration) (*ExecResponse, error) {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+
+    delimiter := fmt.Sprintf("__SANDBOX_%s__", uuid.NewString()[:8])
+
+    // Write wrapped command to stdin:
+    //   echo <delimiter>_START
+    //   <command>
+    //   exitcode=$?
+    //   echo <delimiter>_END
+    //   echo <delimiter>_EXIT_${exitcode} >&2
+    //   echo ${exitcode}  (for exit code capture)
+    wrapped := fmt.Sprintf(
+        "echo %[1]s_START\n%[2]s\n__exit=$?\necho %[1]s_END\necho %[1]s_EXIT_${__exit} >&2\n",
+        delimiter, command,
+    )
+    // ... write to stdin, read stdout until END delimiter,
+    // read stderr until EXIT delimiter, parse exit code ...
+}
+```
+
+The reader goroutines scan for the delimiter markers in stdout and stderr. Stdout content between `_START` and `_END` is the command output. The exit code is parsed from the stderr `_EXIT_<code>` marker.
+
+**Timeout handling:** The agent wraps command execution with a `time.After` timer. If the timeout fires, it sends `SIGKILL` to the bash process group for the running command (not the bash process itself — bash survives and can run the next command).
+
+**Crash recovery:** If the bash process dies (OOM, signal), the agent detects this when the pipe read returns `io.EOF` or the process `Wait()` returns. On the next `/exec` request, it respawns a new bash process and returns the command result with `stderr` containing `"[session state was reset — previous bash process exited]"`. The `/health` endpoint returns 503 if bash is dead and not yet respawned.
+
+**The agent is simple by design.** It doesn't implement security filtering, output truncation, or session routing — those concerns belong in the MCP server or the sandbox boundary.
+
+### Session cleanup
+
+Two mechanisms work together:
+
+**1. Explicit `session_end` tool (primary):**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `session_id` | string | yes | Session to terminate |
+
+The LLM calls `session_end(session_id="inv-abc123")` when the investigation is complete. The handler deletes the sandbox pod by label and removes the cache entry. Returns a confirmation message.
+
+```go
+func (h *SessionEndHandler) Handle(ctx context.Context, req *mcp.CallToolRequest, input SessionEndInput) (*mcp.CallToolResult, error) {
+    if err := h.sessions.CleanupSession(ctx, input.SessionID); err != nil {
+        return nil, fmt.Errorf("failed to end session: %w", err)
+    }
+    return &mcp.CallToolResult{
+        Content: []mcp.Content{
+            mcp.TextContent{Text: fmt.Sprintf("Session %s ended. Sandbox pod deleted.", input.SessionID)},
+        },
+    }, nil
+}
+```
+
+TARSy's instructions include: *"Call session_end when your investigation is complete."*
+
+**2. TTL safety net (fallback):**
+
+A periodic cleanup goroutine (runs every 5 minutes) lists all sandbox pods and deletes any that have been idle beyond `--idle-timeout` (default 30 minutes). Idle time is determined by the `tarsy.redhat.com/last-activity` annotation, which the session manager updates on every `shell_exec` call.
+
+This catches edge cases: LLM crash, TARSy process killed, agent forgetting to call `session_end`.
+
+```go
+func (m *SessionManager) startCleanupLoop(ctx context.Context) {
+    ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            m.cleanupStale(ctx)
+        }
+    }
 }
 
-func (t *CLITool) Tool() *mcp.Tool {
-    return &mcp.Tool{
-        Name:        "execute_" + t.config.Name,
-        Description: t.config.Description,
-        InputSchema: executeInputSchema,
-        Annotations: &mcp.ToolAnnotations{
-            ReadOnlyHint: true,
+func (m *SessionManager) cleanupStale(ctx context.Context) {
+    pods, err := m.clientset.CoreV1().Pods(m.namespace).List(ctx, metav1.ListOptions{
+        LabelSelector: "tarsy.redhat.com/component=cli-mcp-sandbox",
+    })
+    if err != nil {
+        m.logger.Error("failed to list sandbox pods for cleanup", "error", err)
+        return
+    }
+    for _, pod := range pods.Items {
+        lastActivity, _ := time.Parse(time.RFC3339, pod.Annotations["tarsy.redhat.com/last-activity"])
+        if time.Since(lastActivity) > m.config.IdleTimeout {
+            sessionID := pod.Labels["tarsy.redhat.com/session-id"]
+            m.logger.Info("cleaning up stale sandbox pod", "session_id", sessionID, "idle", time.Since(lastActivity))
+            _ = m.clientset.CoreV1().Pods(m.namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+            m.cache.Remove(sessionID)
+        }
+    }
+}
+```
+
+### Sandbox pod spec
+
+The pod spec is built in Go code with CLI flags for the variable parts (`--sandbox-image`, `--idle-timeout`, resource limits via `SandboxConfig`). This is consistent with how `mcp-server-devsandbox` handles configuration — CLI flags via Cobra, no external templates. If operators later need to customize tolerations or node selectors, those can be added as additional flags.
+
+Each sandbox pod is created by the session manager with the following spec:
+
+```go
+func (m *SessionManager) buildPodSpec(sessionID string) *corev1.Pod {
+    return &corev1.Pod{
+        ObjectMeta: metav1.ObjectMeta{
+            GenerateName: "cli-mcp-sandbox-",
+            Namespace:    m.namespace,
+            Labels: map[string]string{
+                "tarsy.redhat.com/session-id": sessionID,
+                "tarsy.redhat.com/component":  "cli-mcp-sandbox",
+            },
+            Annotations: map[string]string{
+                "tarsy.redhat.com/created-at":    time.Now().UTC().Format(time.RFC3339),
+                "tarsy.redhat.com/last-activity": time.Now().UTC().Format(time.RFC3339),
+            },
+        },
+        Spec: corev1.PodSpec{
+            ServiceAccountName: "cli-mcp-investigation-sa",
+            RestartPolicy:      corev1.RestartPolicyOnFailure,
+            SecurityContext: &corev1.PodSecurityContext{
+                RunAsNonRoot: ptr(true),
+                RunAsUser:    ptr(int64(1001)),
+                RunAsGroup:   ptr(int64(1001)),
+            },
+            Containers: []corev1.Container{{
+                Name:  "sandbox-agent",
+                Image: m.config.Image,
+                Ports: []corev1.ContainerPort{{
+                    ContainerPort: 8090,
+                    Protocol:      corev1.ProtocolTCP,
+                }},
+                Resources: corev1.ResourceRequirements{
+                    Requests: corev1.ResourceList{
+                        corev1.ResourceCPU:    resource.MustParse(m.config.CPURequest),
+                        corev1.ResourceMemory: resource.MustParse(m.config.MemoryRequest),
+                    },
+                    Limits: corev1.ResourceList{
+                        corev1.ResourceCPU:    resource.MustParse(m.config.CPULimit),
+                        corev1.ResourceMemory: resource.MustParse(m.config.MemoryLimit),
+                    },
+                },
+                SecurityContext: &corev1.SecurityContext{
+                    AllowPrivilegeEscalation: ptr(false),
+                    Capabilities: &corev1.Capabilities{
+                        Drop: []corev1.Capability{"ALL"},
+                    },
+                },
+                VolumeMounts: []corev1.VolumeMount{
+                    {Name: "kubeconfig", MountPath: "/config", ReadOnly: true},
+                    {Name: "workspace", MountPath: "/workspace"},
+                },
+                ReadinessProbe: &corev1.Probe{
+                    ProbeHandler: corev1.ProbeHandler{
+                        HTTPGet: &corev1.HTTPGetAction{
+                            Path: "/health",
+                            Port: intstr.FromInt(8090),
+                        },
+                    },
+                    InitialDelaySeconds: 2,
+                    PeriodSeconds:       10,
+                },
+                Env: []corev1.EnvVar{
+                    {Name: "KUBECONFIG", Value: "/config/kubeconfig"},
+                    {Name: "HOME", Value: "/workspace"},
+                },
+            }},
+            Volumes: []corev1.Volume{
+                {
+                    Name: "kubeconfig",
+                    VolumeSource: corev1.VolumeSource{
+                        Secret: &corev1.SecretVolumeSource{
+                            SecretName: "cli-mcp-investigation-kubeconfig",
+                        },
+                    },
+                },
+                {
+                    Name: "workspace",
+                    VolumeSource: corev1.VolumeSource{
+                        EmptyDir: &corev1.EmptyDirVolumeSource{},
+                    },
+                },
+            },
         },
     }
 }
+```
 
-func (t *CLITool) RegisterWith(s *mcp.Server) {
-    mcp.AddTool(s, t.Tool(), t.handle)
+**Pod labels and annotations:**
+
+| Label/Annotation | Purpose |
+|---|---|
+| `tarsy.redhat.com/session-id` (label) | Session→pod routing. Used for label-based lookup. |
+| `tarsy.redhat.com/component` (label) | Identifies sandbox pods for bulk operations (list, cleanup). |
+| `tarsy.redhat.com/created-at` (annotation) | Creation timestamp for debugging. |
+| `tarsy.redhat.com/last-activity` (annotation) | Updated on each command execution. Used by TTL cleanup. |
+
+### Output handling
+
+Command output flows through two stages:
+
+1. **Sandbox agent** — captures raw stdout/stderr from the bash process. No truncation at this level — the agent is kept simple.
+2. **MCP server** — truncates combined output at 100KB before returning to TARSy. If truncated, prepends a notice:
+
+```go
+const maxOutputBytes = 100 * 1024
+
+func truncateOutput(stdout, stderr string) (string, string, bool) {
+    combined := len(stdout) + len(stderr)
+    if combined <= maxOutputBytes {
+        return stdout, stderr, false
+    }
+    // Prioritize stdout, keep some stderr for errors
+    maxStdout := maxOutputBytes * 80 / 100
+    maxStderr := maxOutputBytes * 20 / 100
+    if len(stdout) > maxStdout {
+        stdout = stdout[:maxStdout] + "\n[output truncated at 80KB]"
+    }
+    if len(stderr) > maxStderr {
+        stderr = stderr[:maxStderr] + "\n[stderr truncated at 20KB]"
+    }
+    return stdout, stderr, true
 }
 ```
 
-Input schema uses `jsonschema.For[T]()` — consistent with all other MCP servers, enables the typed handler pattern, prevents drift.
+TARSy's existing `data_masking` and `summarization` configs handle post-truncation processing (token scrubbing, token-limit compression).
 
-### Tool input/output types
+### Tool handler
 
-```go
-type ExecuteInput struct {
-    Command string `json:"command" jsonschema:"required,description=CLI command arguments (e.g. 'get pods -n foo -o json')"`
-    Cluster string `json:"cluster" jsonschema:"required,description=Target cluster name (e.g. 'rm1')"`
-    Timeout *int   `json:"timeout,omitempty" jsonschema:"description=Max execution time in seconds"`
-}
-
-type ExecuteOutput struct {
-    CLI           string  `json:"cli"`
-    Cluster       string  `json:"cluster"`
-    Status        string  `json:"status"`
-    Output        string  `json:"output"`
-    ExitCode      int     `json:"exit_code,omitempty"`
-    ExecutionTime float64 `json:"execution_time,omitempty"`
-    Truncated     bool    `json:"truncated,omitempty"`
-}
-```
-
-### Security filter
-
-The security filter runs before command execution and before kubeconfig injection. It operates on the raw parsed command tokens from the LLM:
+The `shell_exec` handler ties together session management, command proxying, and output handling:
 
 ```go
-func (t *CLITool) validate(args []string) error {
-    if len(args) == 0 {
-        return fmt.Errorf("empty command")
-    }
-
-    verb := args[0]
-
-    // Check allowlist — verb must be in the list
-    if !slices.Contains(t.config.Security.AllowedVerbs, verb) {
-        return fmt.Errorf("verb %q is not allowed for %s; allowed: %s",
-            verb, t.config.Name, strings.Join(t.config.Security.AllowedVerbs, ", "))
-    }
-
-    // Check blocklist — full command string must not match any blocked pattern
-    fullCommand := strings.Join(args, " ")
-    for _, pattern := range t.config.Security.BlockedPatterns {
-        if strings.HasPrefix(fullCommand, pattern) {
-            return fmt.Errorf("command %q is blocked for %s", pattern, t.config.Name)
-        }
-    }
-
-    return nil
-}
-```
-
-**`HasPrefix` limitation:** Blocked patterns are matched as command prefixes only (e.g., `"adm drain"` blocks `adm drain node1` but would not catch a hypothetical reordering like `adm --flag drain`). This is sufficient for the current blocked patterns which are all verb+subcommand prefixes. If future patterns need position-independent matching (e.g., blocking a flag like `--as=`), upgrade to `strings.Contains` or regex matching.
-
-### Command execution
-
-Execution goes through a `CommandExecutor` interface for testability. This extends the `mcp-server-devsandbox` `CommandExecutor` pattern by adding `context.Context` for timeout support via `exec.CommandContext`.
-
-```go
-type CommandExecutor interface {
-    Execute(ctx context.Context, command string, args ...string) ([]byte, error)
-    WithEnv(env ...string) CommandExecutor
-}
-```
-
-The handler resolves the target cluster, validates the command, injects kubeconfig flags, and delegates to the executor:
-
-```go
-func (t *CLITool) handle(ctx context.Context, req *mcp.CallToolRequest, input ExecuteInput) (*mcp.CallToolResult, ExecuteOutput, error) {
-    args := strings.Fields(input.Command)
-
-    if err := t.validate(args); err != nil {
-        return nil, ExecuteOutput{}, err
-    }
-
-    // Resolve cluster → kubeconfig path + context
-    cluster, err := t.clusters.Resolve(input.Cluster)
-    if err != nil {
-        return nil, ExecuteOutput{}, err
-    }
-
-    args = append([]string{
-        fmt.Sprintf("--kubeconfig=%s", cluster.KubeconfigPath),
-        fmt.Sprintf("--context=%s", cluster.Context),
-    }, args...)
-
-    // Resolve timeout
-    timeout := t.defaults.Timeout
+func (h *ShellExecHandler) Handle(ctx context.Context, req *mcp.CallToolRequest, input ShellExecInput) (*mcp.CallToolResult, error) {
+    timeout := 60
     if input.Timeout != nil && *input.Timeout > 0 {
-        timeout = min(*input.Timeout, t.defaults.MaxTimeout)
+        timeout = min(*input.Timeout, 300)
     }
 
-    execCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
-    defer cancel()
-
-    start := time.Now()
-    executor := t.executor
-    if len(t.config.Env) > 0 {
-        envSlice := make([]string, 0, len(t.config.Env))
-        for k, v := range t.config.Env {
-            envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
-        }
-        executor = executor.WithEnv(envSlice...)
-    }
-
-    output, err := executor.Execute(execCtx, t.config.Path, args...)
-    duration := time.Since(start)
-
-    truncated := false
-    if len(output) > t.defaults.MaxOutputBytes {
-        output = output[:t.defaults.MaxOutputBytes]
-        truncated = true
-    }
-
-    result := ExecuteOutput{
-        CLI:           t.config.Name,
-        Cluster:       input.Cluster,
-        Status:        "success",
-        Output:        string(output),
-        ExitCode:      0,
-        ExecutionTime: duration.Seconds(),
-        Truncated:     truncated,
-    }
-
-    // Non-zero exit codes are NOT returned as MCP errors. A CLI returning
-    // exit code 1 (e.g., "oc get pod nonexistent" → "NotFound") is still
-    // useful output for the LLM. Only validation failures (bad verb, unknown
-    // cluster) return MCP errors that prevent the tool result from reaching
-    // the LLM.
+    result, err := h.sessions.ExecuteCommand(ctx, input.SessionID, input.Command, timeout)
     if err != nil {
-        result.Status = "error"
-        if exitErr, ok := err.(*exec.ExitError); ok {
-            result.ExitCode = exitErr.ExitCode()
-        }
-        if execCtx.Err() == context.DeadlineExceeded {
-            result.Output = fmt.Sprintf("Command timed out after %d seconds.\n%s", timeout, string(output))
-        }
+        return nil, fmt.Errorf("sandbox exec failed: %w", err)
     }
 
-    return nil, result, nil
+    stdout, stderr, truncated := truncateOutput(result.Stdout, result.Stderr)
+
+    output := ShellExecOutput{
+        Stdout:     stdout,
+        Stderr:     stderr,
+        ExitCode:   result.ExitCode,
+        DurationMs: result.DurationMs,
+        Truncated:  truncated,
+    }
+
+    jsonBytes, _ := json.Marshal(output)
+
+    return &mcp.CallToolResult{
+        Content: []mcp.Content{
+            mcp.TextContent{Text: string(jsonBytes)},
+        },
+        IsError: result.ExitCode != 0,
+    }, nil
 }
 ```
+
+**Non-zero exit codes are returned as tool results with `IsError: true`, not as MCP errors.** A command returning exit code 1 (e.g., `oc get pod nonexistent` → "NotFound") is still useful output for the LLM. Only infrastructure failures (pod creation failed, agent unreachable) return MCP errors.
+
+### Error handling
+
+| Scenario | Behavior |
+|---|---|
+| **Pod creation fails** | Return MCP error. Session manager retries once. |
+| **Agent unreachable** (pod IP, network) | Return MCP error with "sandbox agent unreachable" message. Session manager invalidates cache entry. |
+| **Bash process died** (OOM, crash) | Agent detects on next `/exec`, respawns bash, returns response with `stderr` containing "session state was reset". K8s `RestartPolicy: OnFailure` handles full agent crashes. |
+| **Command timeout** | Agent kills the command after timeout, returns partial output + exit code 137 (SIGKILL). |
+| **Pod evicted** (node pressure) | Next request creates a new pod. Session state is lost — the LLM sees "new session" in the response. |
+| **K8s API unreachable** | Session manager returns MCP error. Health check fails, pod marked not ready. |
 
 ### Server bootstrap
 
-Follows the `mcp-server-devsandbox` pattern but simplified — no `Clients` struct, no toolsets, no shutdown tracker:
-
 ```go
-// cmd/main.go
 func main() {
     var (
-        address    string
-        transport  string
-        configPath string
-        kubeconfig string
-        stateless  bool
+        address        string
+        transport      string
+        stateless      bool
+        namespace      string
+        sandboxImage   string
+        kubeconfigPath string
+        idleTimeout    time.Duration
     )
 
     rootCmd := &cobra.Command{
         Use:   "cli-mcp-server",
-        Short: "MCP server for generic CLI passthrough",
+        Short: "Sandboxed exec environment MCP server for LLM investigation",
         RunE: func(cmd *cobra.Command, args []string) error {
-            cfg, err := loadConfig(configPath)
-            if err != nil {
-                return fmt.Errorf("failed to load config: %w", err)
-            }
-            return runServer(cfg, transport, address, kubeconfig, stateless)
+            return runServer(runConfig{
+                address:        address,
+                transport:      transport,
+                stateless:      stateless,
+                namespace:      namespace,
+                sandboxImage:   sandboxImage,
+                kubeconfigPath: kubeconfigPath,
+                idleTimeout:    idleTimeout,
+            })
         },
     }
 
-    rootCmd.Flags().StringVarP(&address, "address", "a", "localhost:8080", "Server address")
+    rootCmd.Flags().StringVarP(&address, "address", "a", "localhost:8080", "Server address (host:port)")
     rootCmd.Flags().StringVarP(&transport, "transport", "t", "stdio", "Transport (stdio, http)")
-    rootCmd.Flags().StringVarP(&configPath, "config", "c", "/etc/cli-mcp-server/config.yaml", "CLI config file path")
-    rootCmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "Path to combined kubeconfig file")
-    rootCmd.Flags().BoolVar(&stateless, "stateless", false, "Enable stateless mode for multi-replica")
+    rootCmd.Flags().BoolVar(&stateless, "stateless", false, "Enable stateless mode for multi-replica (required for HTTP)")
+    rootCmd.Flags().StringVar(&namespace, "namespace", "tarsy", "Namespace for sandbox pods")
+    rootCmd.Flags().StringVar(&sandboxImage, "sandbox-image", "", "Container image for sandbox pods (required)")
+    rootCmd.Flags().StringVar(&kubeconfigPath, "kubeconfig", "", "Path to combined kubeconfig for sandbox pods")
+    rootCmd.Flags().DurationVar(&idleTimeout, "idle-timeout", 30*time.Minute, "Idle timeout for sandbox pods")
 
     if err := rootCmd.Execute(); err != nil {
         log.Fatalf("Error: %v", err)
@@ -411,62 +572,106 @@ func main() {
 ```
 
 `runServer`:
-1. Splits the kubeconfig into per-cluster kubeconfigs and builds the `ClusterRegistry` (same approach as `mcp-server-devsandbox`'s `SplitToKubeConfigs`)
-2. Creates `mcp.Server` with `mcp-common` middleware
-3. Creates `CommandExecutor` (OS implementation)
-4. Registers tools for each available CLI, passing the shared `ClusterRegistry` and `CommandExecutor`
-5. Sets up HTTP mux with `/mcp`, `/metrics`, `/live`, `/health`
-6. Signal handling for graceful shutdown
+1. Creates Kubernetes clientset (in-cluster config — the MCP server runs in K8s)
+2. Creates `SessionManager` with sandbox config
+3. Creates `mcp.Server` with `mcp-common` middleware (metrics, logging)
+4. Registers `shell_exec` and `session_end` tools
+5. Starts stale pod cleanup goroutine
+6. Sets up HTTP mux with `/mcp`, `/metrics`, `/live`, `/health`
+7. Signal handling for graceful shutdown
 
-Health check runs `oc version` (without `--client`) against one cluster to verify the full path: binary exists, kubeconfig works, cluster reachable. No additional K8s `client-go` dependency needed. Process-per-probe (~100–200ms every 10s) is negligible for a server designed around spawning CLI processes.
+**Health check:** The `/health` endpoint verifies the session manager can reach the Kubernetes API (a lightweight namespace get). It does not check individual sandbox pods — those are checked lazily on request.
+
+## Go Types Summary
+
+```go
+// --- MCP server types ---
+
+type ShellExecInput struct {
+    Command   string `json:"command" jsonschema:"required,description=Shell command to execute"`
+    SessionID string `json:"session_id" jsonschema:"required,description=Session identifier for sandbox routing"`
+    Timeout   *int   `json:"timeout,omitempty" jsonschema:"description=Max execution time in seconds (default 60)"`
+}
+
+type ShellExecOutput struct {
+    Stdout     string `json:"stdout"`
+    Stderr     string `json:"stderr"`
+    ExitCode   int    `json:"exit_code"`
+    DurationMs int64  `json:"duration_ms"`
+    Truncated  bool   `json:"truncated,omitempty"`
+}
+
+type SessionEndInput struct {
+    SessionID string `json:"session_id" jsonschema:"required,description=Session to terminate"`
+}
+
+// --- Sandbox agent types (shared contract) ---
+
+type ExecRequest struct {
+    Command string `json:"command"`
+    Timeout int    `json:"timeout,omitempty"`
+}
+
+type ExecResponse struct {
+    Stdout     string `json:"stdout"`
+    Stderr     string `json:"stderr"`
+    ExitCode   int    `json:"exit_code"`
+    DurationMs int64  `json:"duration_ms"`
+}
+```
 
 ## Project Structure
 
 ```
 cli-mcp-server/
 ├── cmd/
-│   └── main.go                    # Cobra root, flag parsing, entry point
+│   ├── server/
+│   │   └── main.go                # MCP server entry point (Cobra, flags, bootstrap)
+│   └── agent/
+│       └── main.go                # Sandbox agent entry point (HTTP server, bash session)
 ├── pkg/
-│   ├── cluster/
-│   │   ├── registry.go            # ClusterRegistry — kubeconfig splitting, cluster resolution
-│   │   └── registry_test.go
-│   ├── config/
-│   │   ├── config.go              # Config types, YAML loading, validation
-│   │   └── config_test.go
-│   ├── executor/
-│   │   ├── executor.go            # CommandExecutor interface + OS implementation
-│   │   ├── executor_test.go
-│   │   └── fake/
-│   │       └── fake.go            # Test fake for CommandExecutor
-│   ├── security/
-│   │   ├── filter.go              # Allowlist + blocklist validation
-│   │   └── filter_test.go
+│   ├── session/
+│   │   ├── manager.go             # SessionManager — pod lifecycle, cache, cleanup
+│   │   ├── manager_test.go
+│   │   ├── cache.go               # PodCache — in-memory TTL cache for pod IPs
+│   │   └── cache_test.go
+│   ├── agent/
+│   │   ├── client.go              # HTTP client for sandbox agent API
+│   │   ├── client_test.go
+│   │   └── types.go               # ExecRequest/ExecResponse (shared contract)
+│   ├── sandbox/
+│   │   ├── bash.go                # Persistent bash session management
+│   │   ├── bash_test.go
+│   │   ├── handler.go             # HTTP handlers (POST /exec, GET /health)
+│   │   └── handler_test.go
 │   ├── server/
 │   │   ├── server.go              # MCP server setup, middleware, endpoints
 │   │   └── server_test.go
 │   └── tools/
-│       ├── cli_tool.go            # CLITool — tool definition, handler, registration
-│       └── cli_tool_test.go
-├── config/
-│   └── default.yaml               # Default CLI config baked into the image
+│       ├── shell_exec.go          # shell_exec tool — handler, registration
+│       ├── shell_exec_test.go
+│       ├── session_end.go         # session_end tool — handler, registration
+│       └── session_end_test.go
 ├── docs/
 │   └── proposals/
 │       ├── cli-mcp-server-sketch.md
 │       ├── cli-mcp-server-proposal.md
 │       └── cli-mcp-server-design.md
-├── Dockerfile
+├── Dockerfile.server              # MCP server image (multi-stage Go build)
+├── Dockerfile.agent               # Sandbox agent image (agent binary + CLIs + utils)
 ├── Makefile
 ├── go.mod
 ├── go.sum
 └── README.md
 ```
 
-Project uses `cmd/` + `pkg/` layout. `mcp-server-devsandbox` uses `sandbox/` + `pkg/` (functionally equivalent; `cmd/` is the more standard Go convention). Allows potential library reuse.
+Two binaries, two images, one repo. The `pkg/agent/types.go` file contains the shared request/response contract between the server (as HTTP client) and the agent (as HTTP server).
 
-## Dockerfile
+## Dockerfiles
+
+### MCP server (`Dockerfile.server`)
 
 ```dockerfile
-# ---------- Stage 1: Build ----------
 FROM golang:1.24-alpine AS builder
 RUN apk add --no-cache git make
 WORKDIR /workspace
@@ -474,43 +679,62 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 ARG VERSION=dev
-RUN make build GIT_COMMIT_ID=${VERSION}
+RUN CGO_ENABLED=0 go build -ldflags="-X main.version=${VERSION}" -o bin/cli-mcp-server ./cmd/server/
 
-# ---------- Stage 2: Runtime ----------
-# Base image includes oc; kubectl is a symlink to oc on OpenShift
-FROM quay.io/codeready-toolchain/oc-client-base-minimal
-
-# Server binary
+FROM gcr.io/distroless/static-debian12
 COPY --from=builder /workspace/bin/cli-mcp-server /usr/bin/
-
-# Default config
-COPY config/default.yaml /etc/cli-mcp-server/config.yaml
-
-# Non-root user (same pattern as mcp-server-devsandbox)
-RUN groupadd -g 1001 mcpuser \
-    && useradd -u 1001 -g 1001 -r -s /bin/sh -d /home/mcpuser mcpuser \
-    && mkdir -p /home/mcpuser && chown -R 1001:1001 /home/mcpuser
-
-USER mcpuser
-
+USER 1001
 ENTRYPOINT ["/usr/bin/cli-mcp-server"]
-CMD ["--transport", "http"]
+CMD ["--transport", "http", "--stateless"]
 ```
 
-> **Adding future CLIs:** Install the binary in a new `RUN` layer (same as `mcp-server-devsandbox` installs `virtctl`) and add a config entry. No server code changes.
+The server image is minimal — no CLIs needed. It only manages pods and proxies HTTP.
+
+### Sandbox agent (`Dockerfile.agent`)
+
+```dockerfile
+FROM golang:1.24-alpine AS builder
+RUN apk add --no-cache git make
+WORKDIR /workspace
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -ldflags="-X main.version=${VERSION}" -o bin/sandbox-agent ./cmd/agent/
+
+FROM quay.io/codeready-toolchain/oc-client-base-minimal
+
+# Agent binary
+COPY --from=builder /workspace/bin/sandbox-agent /usr/bin/
+
+# Unix utilities for investigation
+RUN microdnf install -y jq yq curl && microdnf clean all
+
+# Non-root user
+RUN groupadd -g 1001 sandbox \
+    && useradd -u 1001 -g 1001 -r -s /bin/bash -d /workspace sandbox \
+    && mkdir -p /workspace && chown -R 1001:1001 /workspace
+
+USER 1001
+WORKDIR /workspace
+ENTRYPOINT ["/usr/bin/sandbox-agent"]
+```
+
+The agent image includes CLIs and utilities. Adding a future CLI means a `RUN` layer — no code changes.
 
 ## Kubernetes Deployment (sandbox-sre)
 
-The deployment manifests follow the exact pattern of `kubernetes-mcp-server` and `mcp-server-devsandbox`. These live in `sandbox-sre/components/cli-mcp-server/`.
+Manifests live in `sandbox-sre/components/cli-mcp-server/`.
 
 ### Key manifests
 
 | File | Purpose |
 |---|---|
-| `deployment.yaml` | kube-rbac-proxy sidecar + main container, kubeconfig mount, config mount |
+| `deployment.yaml` | MCP server: kube-rbac-proxy sidecar + main container |
 | `service.yaml` | ClusterIP port 8443, serving cert annotation |
-| `service-accounts.yaml` | Server SA (`cli-mcp-server`) + client SA (`cli-mcp-client`) + RBAC |
-| `network-policy.yaml` | Ingress restrictions |
+| `service-accounts.yaml` | `cli-mcp-server` SA (pod management RBAC) |
+| `investigation-sa.yaml` | `cli-mcp-investigation-sa` SA (read-only cluster access for sandbox pods) |
+| `network-policy.yaml` | Ingress to MCP server + ingress/egress for sandbox pods |
 | `kustomization.yaml` | Ties everything together |
 
 ### Deployment args
@@ -522,25 +746,124 @@ args:
   - --address
   - 127.0.0.1:8080
   - --stateless
+  - --namespace
+  - tarsy
+  - --sandbox-image
+  - quay.io/codeready-toolchain/cli-mcp-sandbox:latest
   - --kubeconfig
-  - /config/kubeconfig    # combined kubeconfig with contexts for all target clusters
-  - --config
-  - /etc/cli-mcp-server/config.yaml
+  - /config/kubeconfig
+  - --idle-timeout
+  - 30m
 ```
 
-### Config override via ConfigMap
+### RBAC
 
-For environment-specific CLI configs (e.g., different allowed verbs in staging vs production):
+**`cli-mcp-server` SA** (MCP server pod):
 
 ```yaml
-volumes:
-  - name: cli-config
-    configMap:
-      name: cli-mcp-server-config
-      optional: true  # falls back to baked-in default
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cli-mcp-server
+  namespace: tarsy
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch"]
 ```
 
-ConfigMap override uses **full replace** — simpler to reason about, avoids merge ambiguity, operator always sees exactly what's deployed.
+Scoped to `tarsy` namespace only. `patch` is needed to update the `last-activity` annotation on command execution.
+
+**`cli-mcp-investigation-sa` SA** (mounted into sandbox pods):
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cli-mcp-investigation-readonly
+subjects:
+  - kind: ServiceAccount
+    name: cli-mcp-investigation-sa
+    namespace: tarsy
+roleRef:
+  kind: ClusterRole
+  name: view   # standard K8s read-only
+```
+
+Plus custom ClusterRoles for `list-nodes` and `kube-investigation-readonly` (cluster-scoped reads). No `pods/exec`, no write operations.
+
+### NetworkPolicy for sandbox pods
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cli-mcp-sandbox
+  namespace: tarsy
+spec:
+  podSelector:
+    matchLabels:
+      tarsy.redhat.com/component: cli-mcp-sandbox
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: cli-mcp-server
+      ports:
+        - port: 8090
+          protocol: TCP
+  egress:
+    - to:
+        - ipBlock:
+            cidr: <k8s-api-server-cidr>
+      ports:
+        - port: 6443
+          protocol: TCP
+    - to:  # DNS resolution
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+```
+
+## TARSy Integration
+
+### tarsy.yaml configuration
+
+```yaml
+mcp_servers:
+  cli-mcp-server:
+    transport:
+      type: "http"
+      url: "https://cli-mcp-server:8443/mcp"
+      bearer_token: "{{.CLI_MCP_BEARER_TOKEN}}"
+      timeout: 90
+      verify_ssl: false
+    instructions: |
+      This server provides a sandboxed shell environment for cluster investigation.
+      You have full bash access: pipes, redirects, chaining, and standard Unix tools (jq, grep, awk).
+      Available CLIs: oc, kubectl.
+      Available clusters: rm1, rm2, rm3. Use --context=<cluster> to target a specific cluster.
+      Your workspace at /workspace is ephemeral — use it for intermediate files during investigation.
+      All cluster access is read-only via RBAC.
+      Always pass your investigation ID as session_id in every shell_exec call.
+      Call session_end when your investigation is complete.
+    data_masking:
+      enabled: true
+      pattern_groups: ["kubernetes", "security"]
+      patterns: ["certificate", "token", "email"]
+    summarization:
+      enabled: true
+      summary_max_token_limit: 1200
+```
 
 ## Testing Strategy
 
@@ -548,97 +871,61 @@ ConfigMap override uses **full replace** — simpler to reason about, avoids mer
 
 | Package | What's tested | Approach |
 |---|---|---|
-| `pkg/security` | Allowlist/blocklist validation | Table-driven: valid commands, blocked verbs, blocked patterns, edge cases |
-| `pkg/tools` | Tool handler — parsing, cluster resolution, kubeconfig injection, timeout, truncation, error handling | `CommandExecutor` fake that records calls and returns canned output |
-| `pkg/cluster` | Cluster registry — kubeconfig splitting, resolution, unknown cluster error | In-memory kubeconfig data |
-| `pkg/config` | YAML loading, validation, defaults | Load from string, check parsed values |
-| `pkg/server` | Tool registration, CLI discovery (binary not found → skipped) | In-memory config with fake executor |
+| `pkg/session` | Pod creation, cache hit/miss, cleanup, stale detection | `client-go` fake clientset (`fake.NewSimpleClientset`) |
+| `pkg/agent` (client) | HTTP client for agent API — success, timeout, error | `httptest.NewServer` with canned responses |
+| `pkg/sandbox` | Bash session — command execution, exit codes, env persistence, crash recovery | Real `bash` process in test (short-lived) |
+| `pkg/tools` | `shell_exec` handler — session routing, truncation, error mapping | Mock `SessionManager` interface |
+| `pkg/server` | Tool registration, health check, middleware | In-memory server |
 
 ### Integration tests
 
-Testing uses **unit tests with fakes only** — consistent with `mcp-server-devsandbox` (`fake.MemoizedCommandExecutor`). Integration tests with real binaries can be added later if needed.
-
-### Test fake for command execution
-
-Inspired by `mcp-server-devsandbox`'s `fake.MemoizedCommandExecutor` (which uses a builder pattern: `OnCommand().Return()`), adapted with `context.Context` support:
-
-```go
-type FakeExecutor struct {
-    mu       sync.Mutex
-    expected []ExpectedCall
-    calls    []RecordedCall
-}
-
-type ExpectedCall struct {
-    Command  string
-    Args     []string
-    Output   []byte
-    Error    error
-}
-
-func (f *FakeExecutor) Execute(ctx context.Context, command string, args ...string) ([]byte, error) {
-    f.mu.Lock()
-    defer f.mu.Unlock()
-    f.calls = append(f.calls, RecordedCall{Command: command, Args: args})
-    for _, e := range f.expected {
-        if e.Command == command && slicesEqual(e.Args, args) {
-            return e.Output, e.Error
-        }
-    }
-    return nil, fmt.Errorf("unexpected command: %s %v", command, args)
-}
-
-func (f *FakeExecutor) WithEnv(env ...string) CommandExecutor { return f }
-```
+Unit tests with fakes cover the critical paths. Integration tests with real sandbox pods can be added later for end-to-end validation if needed — consistent with `mcp-server-devsandbox`'s approach.
 
 ## Implementation Plan
 
-### Phase 1: Core server (oc + kubectl)
+### Phase 1: Sandbox agent
 
-1. Initialize Go module, `go.mod` with `go-sdk v1.4.0`, `mcp-common`, Cobra
-2. Implement `pkg/config` — YAML loading, validation, defaults
-3. Implement `pkg/cluster` — kubeconfig splitting, `ClusterRegistry`
-4. Implement `pkg/security` — allowlist + blocklist filter
-5. Implement `pkg/executor` — `CommandExecutor` interface (with `context.Context`) + OS implementation + fake
-6. Implement `pkg/tools` — `CLITool` with registration, handler, cluster resolution, kubeconfig injection
-7. Implement `cmd/main.go` — Cobra root, server bootstrap
-8. Implement `pkg/server` — MCP server setup with middleware, endpoints
-9. Write `config/default.yaml` with `oc` and `kubectl` configs
-10. Write Dockerfile (base image already includes `oc`; `kubectl` is symlinked)
-11. Write Makefile (`build`, `test`, `docker-build`)
-12. Unit tests for all packages
+1. Implement `pkg/sandbox/bash.go` — persistent bash session (spawn, pipe, command execution, crash detection)
+2. Implement `pkg/sandbox/handler.go` — HTTP handlers (`POST /exec`, `GET /health`)
+3. Implement `cmd/agent/main.go` — entry point, HTTP server setup
+4. Write `Dockerfile.agent`
+5. Unit tests for bash session management
 
-### Phase 2: Deployment
+### Phase 2: MCP server core
+
+1. Initialize Go module with `go-sdk`, `mcp-common`, `client-go`, Cobra
+2. Implement `pkg/session/cache.go` — in-memory pod IP cache with TTL
+3. Implement `pkg/session/manager.go` — pod lifecycle (create, discover, cleanup, stale)
+4. Implement `pkg/agent/client.go` — HTTP client for agent API
+5. Implement `pkg/tools/shell_exec.go` — tool handler, registration
+6. Implement `cmd/server/main.go` — Cobra root, server bootstrap
+7. Implement `pkg/server/server.go` — MCP server setup with middleware
+8. Write `Dockerfile.server`
+9. Unit tests for all packages
+
+### Phase 3: Deployment
 
 1. Create `sandbox-sre/components/cli-mcp-server/` kustomize manifests
-2. ServiceAccount, ClusterRole/Binding for `/mcp` access
+2. ServiceAccounts and RBAC (both `cli-mcp-server` and `cli-mcp-investigation-sa`)
 3. Service with serving cert annotation
-4. NetworkPolicy
-5. Staging overlay with kubeconfig secret reference (same multi-cluster kubeconfig as `mcp-server-devsandbox`)
+4. NetworkPolicy for both MCP server and sandbox pods
+5. Staging overlay with kubeconfig secret reference
 6. Add `cli-mcp-server` entry to `tarsy.yaml`
-7. Wire to selected agents (per team decision on Q7 from sketch)
 
-### Phase 3: Production rollout
+### Phase 4: Production rollout
 
 1. Production overlay
-2. Monitor token usage, LLM behavior, command patterns
-3. Iterate on security rules based on real usage
-4. Evaluate: can this subsume `kubernetes-mcp-server` for investigation agents?
-
-### Future: Additional CLIs
-
-When needed, add CLIs by installing binaries in the Dockerfile and adding config entries. No server code changes. Candidates: `virtctl`, `helm`, `sandboxctl`, `argocd`.
+2. Monitor pod lifecycle, command patterns, resource usage
+3. Iterate on resource limits and idle timeouts based on real usage
+4. Evaluate adding more CLIs (`virtctl`, `helm`) based on agent needs
 
 ## Design Decisions Summary
 
-All decisions finalized.
+| # | Topic | Decision | Rationale |
+|---|---|---|---|
+| Q1 | Session identification | Explicit `session_id` parameter in `shell_exec` | Server stays stateless (consistent with all MCP servers). Pod labels as source of truth. Any replica serves any request. TARSy passes its investigation ID. |
+| Q2 | Session cleanup | `session_end` tool (primary) + TTL safety net (fallback, 30m idle) | Immediate resource cleanup when LLM calls `session_end`. TTL catches edge cases (LLM crash, forgotten cleanup). Matches OpenHands pattern. |
+| Q3 | Pod template source | Hardcoded Go struct + CLI flags for overrides | Simplest approach, consistent with `mcp-server-devsandbox`. Variable parts (image, resources, namespace, timeout) exposed as flags. Can evolve to ConfigMap overrides later if needed. |
+| Q4 | Sandbox agent bash implementation | Pipe-based with delimiter protocol (stdin/stdout/stderr pipes, UUID delimiters) | Clean stdout/stderr separation for structured responses. No external dependencies. Well-known pattern (OpenHands, Claude Code). UUID delimiters prevent collisions. PTY adds complexity with no benefit for LLM consumption. |
 
-| # | Question | Decision |
-|---|---|---|
-| Q1 | Config structure | Flat list of CLIs |
-| Q2 | Input schema | `jsonschema.For[T]()` with typed handler |
-| Q3 | Command execution | `CommandExecutor` interface (extends devsandbox pattern with `context.Context`) |
-| Q4 | Health check | CLI command (`oc version` — validates binary + cluster) |
-| Q5 | Project layout | `cmd/` + `pkg/` |
-| Q6 | ConfigMap override | Full replace |
-| Q7 | Integration tests | Unit tests with fakes only (for now) |
+**Note on future write capabilities:** If the server later adds write-capable CLIs (e.g., `helm install`, `oc apply`), per-cluster sandbox pods should be considered. With write access, targeting the wrong cluster has destructive consequences, and per-cluster isolation eliminates that risk. For read-only investigation, a shared kubeconfig with all contexts is safe.

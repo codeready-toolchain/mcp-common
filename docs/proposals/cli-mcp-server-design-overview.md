@@ -1,0 +1,202 @@
+# CLI MCP Server — Design Overview
+
+**Status:** Final
+
+**Related documents:**
+- [Sketch](cli-mcp-server-sketch.md) — problem statement, approach selection, high-level decisions
+- [Detailed Design](cli-mcp-server-design.md) — Go types, implementation details, code samples
+
+---
+
+## What it is
+
+A new MCP server that gives TARSy investigation agents a **sandboxed shell environment** — an isolated Kubernetes pod where the LLM has a persistent bash session with full CLI access. Think of it as giving the LLM the same capabilities a developer has in a terminal, but running inside a locked-down container.
+
+The server exposes two tools:
+- **`shell_exec`** — run any shell command in the sandbox
+- **`session_end`** — clean up the sandbox when the investigation is done
+
+## Why it exists
+
+Today, TARSy agents can only use pre-built, structured MCP tools. When an investigation needs a command not covered by an existing tool (e.g., `oc adm top nodes`, piping output through `jq`, or comparing resources across clusters), the LLM is stuck. Adding each new command requires Go code, PR review, build, and deploy.
+
+Beyond the coverage gap, structured tools fundamentally limit what the LLM can do. It cannot pipe output through utilities, chain commands, write intermediate files, or build up context across calls. Local coding agents (Claude Code, Cursor, OpenHands) give developers all of these capabilities. This server brings the same power to TARSy, but in a sandboxed Kubernetes environment.
+
+This server **complements** existing structured MCP servers — it doesn't replace them. Structured tools remain better for well-understood, high-frequency operations. This server handles the long tail.
+
+## How it works
+
+### Two components
+
+**1. The MCP server** (control plane) — a stateless Go binary deployed as a standard MCP server (kube-rbac-proxy, TLS, metrics). Its job is managing sandbox pods and proxying commands. It doesn't parse, validate, or transform shell commands.
+
+**2. The sandbox agent** (data plane) — a lightweight Go binary (~200-300 lines) that runs inside each sandbox pod. It manages a persistent bash session and exposes a simple HTTP API: `POST /exec` to run commands and `GET /health` for readiness checks.
+
+### The flow
+
+1. TARSy calls `shell_exec(command="oc get pods -n foo --context=rm1", session_id="inv-abc123")`
+2. The MCP server looks up the sandbox pod for session `inv-abc123` using Kubernetes labels
+3. If no pod exists, it creates one and waits for it to be ready
+4. It sends the command to the sandbox agent via HTTP
+5. The agent pipes the command into the persistent bash process, captures stdout/stderr, and returns a structured JSON response (output, exit code, execution time)
+6. The MCP server truncates output if it exceeds 100KB and returns the result to TARSy
+
+### Session lifecycle
+
+Each investigation gets its own sandbox pod. The pod is created on the first `shell_exec` call and persists for the duration of the investigation. Environment variables, working directory, and files persist between calls because the bash process stays alive.
+
+When the investigation is done:
+- **Primary cleanup:** The LLM calls `session_end(session_id="inv-abc123")`, which immediately deletes the pod.
+- **Fallback cleanup:** A TTL safety net deletes pods that have been idle for 30 minutes, catching cases where the LLM crashes or forgets to clean up.
+
+## Key design decisions
+
+### 1. Stateless server with explicit session routing
+
+The MCP server runs in **stateless mode**, consistent with all other MCP servers. Every `shell_exec` call includes a `session_id` parameter (typically the TARSy investigation ID). The server routes to the correct sandbox pod by looking up Kubernetes labels — no in-memory session tracking, no sticky sessions. Any server replica can handle any request.
+
+This was chosen over MCP SDK session management (stateful mode) because other MCP servers are stateless, and adding statefulness would require sticky sessions or shared state for multi-replica deployments.
+
+### 2. Security from the sandbox boundary
+
+There are no application-level command allowlists or blocklists. Security comes from the sandbox itself:
+
+- **RBAC** — the kubeconfig mounted in the sandbox pod uses a dedicated ServiceAccount (`cli-mcp-investigation-sa`) with read-only permissions. No `pods/exec`, no write operations, no VM lifecycle.
+- **Pod isolation** — each investigation gets its own pod. No cross-session filesystem access.
+- **Network isolation** — a NetworkPolicy restricts sandbox pods to only reach Kubernetes API servers. No internet access, no access to other services.
+- **Ephemeral storage** — the `/workspace` filesystem is an `emptyDir` volume that is destroyed when the pod is deleted. No data persists between investigations.
+- **Resource limits** — CPU/memory limits per sandbox pod prevent resource abuse.
+- **Output truncation** — command output is capped at 100KB to prevent token explosion.
+
+### 3. Pipe-based bash session with delimiter protocol
+
+The sandbox agent manages a persistent `bash` process using Go's standard library pipes (stdin/stdout/stderr). Each command is wrapped with UUID-based delimiters to isolate its output from the continuous stream. This gives clean stdout/stderr separation (important for structured responses) without needing PTY complexity, which adds no value for LLM consumption.
+
+If the bash process crashes (OOM, signal), the agent respawns it on the next request and notifies the LLM that session state was reset.
+
+### 4. Hardcoded pod spec with CLI flag overrides
+
+The sandbox pod specification is built in Go code. Variable parts (container image, resource limits, namespace, idle timeout) are exposed as CLI flags, consistent with how `mcp-server-devsandbox` handles configuration. This can evolve to ConfigMap overrides later if operators need more flexibility.
+
+## Architecture diagram
+
+```
+TARSy
+  ↓ (bearer token)
+kube-rbac-proxy (TLS :8443)
+  ↓
+cli-mcp-server (:8080, stateless, N replicas)
+  ├── shell_exec handler
+  │     ├── Find sandbox pod by label (session_id)
+  │     ├── Create pod if missing (client-go)
+  │     └── Proxy command to sandbox agent (HTTP)
+  ├── session_end handler
+  │     └── Delete sandbox pod by label
+  └── Stale pod cleanup (every 5 min, TTL 30 min)
+       ↓ HTTP (pod IP:8090)
+  Sandbox Pod (one per investigation, tarsy namespace)
+  ├── sandbox-agent → persistent bash session
+  ├── CLIs: oc, kubectl
+  ├── Utils: jq, yq, grep, awk, curl
+  ├── /config/kubeconfig (read-only, investigation SA)
+  ├── /workspace/ (ephemeral, writable)
+  └── NetworkPolicy: ingress from MCP server, egress to K8s API only
+       ↓
+  Target K8s clusters (via read-only kubeconfig)
+```
+
+## MCP tools
+
+### `shell_exec`
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `command` | string | yes | Shell command to execute (full bash — pipes, redirects, chaining) |
+| `session_id` | string | yes | Session identifier (typically the TARSy investigation ID) |
+| `timeout` | int | no | Max execution time in seconds (default 60, max 300) |
+
+Example usage:
+
+```
+shell_exec(command="oc get clusteroperators --context=rm1", session_id="inv-abc123")
+
+shell_exec(command="oc get pods -n openshift-ingress --context=rm1 -o json | jq '.items[] | {name: .metadata.name, ready: .status.containerStatuses[0].ready}'", session_id="inv-abc123")
+
+shell_exec(command="diff <(oc get pods --context=rm1 -o name) <(oc get pods --context=rm2 -o name)", session_id="inv-abc123")
+
+shell_exec(command="export CTX=rm1; for ns in $(oc get ns --context=$CTX -o name | head -10); do echo \"=== $ns ===\"; oc get pods --context=$CTX -n ${ns#namespace/} --no-headers 2>/dev/null | wc -l; done", session_id="inv-abc123")
+```
+
+Non-zero exit codes are returned as tool results (not MCP errors) — a command returning "NotFound" is still useful output for the LLM.
+
+### `session_end`
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `session_id` | string | yes | Session to terminate |
+
+Immediately deletes the sandbox pod and frees resources.
+
+## ServiceAccounts and RBAC
+
+Two ServiceAccounts with distinct roles:
+
+| ServiceAccount | Used by | Permissions |
+|---|---|---|
+| `cli-mcp-server` | MCP server pod | Manage sandbox pods in `tarsy` namespace (`create`, `delete`, `get`, `list`, `watch`, `patch` pods) |
+| `cli-mcp-investigation-sa` | Sandbox pods (via kubeconfig) | Read-only cluster access: `view` ClusterRole, `list-nodes`, `kube-investigation-readonly`. No `pods/exec`, no write operations. |
+
+The MCP server SA is scoped to the `tarsy` namespace. The investigation SA is tightly scoped because the LLM has full shell access — it can exercise any permission the SA has.
+
+## Error handling
+
+| Scenario | Behavior |
+|---|---|
+| Pod creation fails | MCP error returned, session manager retries once |
+| Agent unreachable | MCP error, cache entry invalidated, next request retries |
+| Bash process crashes | Agent respawns bash, notifies LLM that session state was reset |
+| Command timeout | Agent kills command, returns partial output with exit code 137 |
+| Pod evicted | Next request creates new pod, LLM sees "new session" |
+| K8s API unreachable | MCP error, health check fails |
+
+## Deployment
+
+The MCP server follows the established deployment pattern (kube-rbac-proxy sidecar, serving cert, NetworkPolicy). It is deployed in the `tarsy` namespace alongside existing MCP servers.
+
+Two container images:
+- **MCP server image** — minimal (distroless), contains only the server binary. No CLIs needed.
+- **Sandbox agent image** — based on `oc-client-base-minimal`, includes the agent binary, `oc`, `kubectl`, and Unix utilities (`jq`, `yq`, `curl`, `grep`, `awk`).
+
+Adding a future CLI (e.g., `virtctl`, `helm`) means installing the binary in the sandbox agent image — no server code changes.
+
+### TARSy configuration
+
+The server is added as an `mcp_servers` entry in `tarsy.yaml`. Agent instructions tell the LLM how to use the sandbox, which clusters are available, and to always pass the investigation ID as `session_id`.
+
+## Implementation phases
+
+1. **Sandbox agent** — persistent bash session, HTTP API, Dockerfile
+2. **MCP server core** — session manager, pod lifecycle, tool handlers, Dockerfile
+3. **Deployment** — kustomize manifests, RBAC, NetworkPolicy, TARSy integration
+4. **Production rollout** — monitoring, tuning, additional CLIs based on usage
+
+## What is out of scope
+
+- Replacing existing structured MCP servers — this is additive
+- Write/mutate operations against clusters — read-only investigation by design
+- Interactive commands requiring stdin — no `oc edit`, no interactive `oc exec -it`
+- Multi-tenancy / per-user credentials — uses shared kubeconfig
+- Warm pod pools — can be added later if cold start latency is a problem
+
+## Future considerations
+
+If the server later adds write-capable CLIs (e.g., `helm install`, `oc apply`), per-cluster sandbox pods should be considered. With write access, targeting the wrong cluster has destructive consequences, and per-cluster isolation eliminates that risk. For read-only investigation, a shared kubeconfig with all contexts is safe.
+
+## Design decisions summary
+
+| # | Topic | Decision | Rationale |
+|---|---|---|---|
+| 1 | Session identification | Explicit `session_id` parameter | Server stays stateless (consistent with all MCP servers). Pod labels as source of truth. Any replica serves any request. |
+| 2 | Session cleanup | `session_end` tool + TTL safety net (30m) | Immediate cleanup when LLM calls `session_end`. TTL catches edge cases (crash, forgotten cleanup). |
+| 3 | Pod template source | Hardcoded Go struct + CLI flags | Simplest approach, consistent with existing MCP servers. Can evolve to ConfigMap overrides later. |
+| 4 | Bash session management | Pipe-based with UUID delimiter protocol | Clean stdout/stderr separation. No external dependencies. Well-known pattern used by OpenHands and Claude Code. |

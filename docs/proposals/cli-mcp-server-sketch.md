@@ -1,4 +1,4 @@
-# CLI MCP Server — Generic CLI Passthrough for LLM Investigation
+# CLI MCP Server — Sandboxed Exec Environment for LLM Investigation
 
 **Status:** Sketch complete — ready for detailed design.
 
@@ -19,46 +19,68 @@ Today, six MCP servers provide structured tools:
 
 Each new investigation pattern requires Go code → PR → review → build → deploy. The long tail of edge cases makes this unsustainable.
 
+Beyond the coverage gap, existing structured tools fundamentally limit what the LLM can do. It cannot:
+
+- Pipe output through utilities (`oc get pods -o json | jq '.items[].metadata.name'`)
+- Chain commands (`oc get nodes && oc adm top nodes`)
+- Write intermediate files for multi-step analysis
+- Use standard Unix tools (`grep`, `awk`, `sort`, `wc`, `jq`) on command output
+- Build up context incrementally across calls (environment variables, working directory, files)
+
+Local coding agents (Claude Code, Cursor, OpenHands, OpenClaw) give developers all of these capabilities. The goal is to provide the same power to TARSy investigation agents, but in a sandboxed Kubernetes environment.
+
 ## Goal
 
-A new, standalone MCP server that gives TARSy agents generic, read-only CLI access to bundled command-line tools. **Initial scope: `oc` and `kubectl`.** The architecture is config-driven and extensible to additional CLIs (e.g., `virtctl`, `sandboxctl`, `helm`, `argocd`) in the future without code changes.
+A new MCP server that provides TARSy agents with a **sandboxed execution environment** — a per-investigation Kubernetes pod where the LLM has a persistent bash shell with full CLI access. Security comes from the sandbox boundary (RBAC, pod isolation, network isolation), not from application-level command filtering.
 
-The server targets a **multi-cluster** environment — the LLM specifies the target cluster by name, and the server resolves the corresponding kubeconfig and context (same shared kubeconfig as `mcp-server-devsandbox`). The LLM constructs and executes CLI commands directly, with security enforced at multiple layers.
+The server manages sandbox pod lifecycle: creating pods on demand, proxying shell commands into them via a lightweight agent binary, and cleaning up when investigations end.
 
-This server **complements** existing structured MCP servers — it doesn't replace them. Structured tools remain better for well-understood, high-frequency operations. This server covers the long tail.
+**Initial scope:** `oc` and `kubectl`, plus standard Unix utilities (`jq`, `grep`, `awk`). The sandbox image is extensible to additional CLIs (e.g., `virtctl`, `helm`) by installing binaries — no server code changes.
 
-## Approach Options
+This server **complements** existing structured MCP servers — it doesn't replace them. Structured tools remain better for well-understood, high-frequency operations. This server gives the LLM the flexibility to handle the long tail.
 
-Three architectural approaches were evaluated. This sketch proceeds with **Option 1**, chosen for its balance of LLM usability, security granularity, and extensibility.
+## How Local Agents Do It
 
-### Option 1: Per-CLI Tools with Rich Descriptions (selected)
+Research across five major open-source coding agents shows a consistent pattern: a persistent shell session with full bash access, security enforced by environment boundaries rather than command filtering.
 
-Register a separate `execute_<cli>` tool for each bundled CLI. The LLM picks the right tool based on MCP tool descriptions — the same mechanism that drives tool selection across all existing MCP servers.
+| Agent | Execution Model | Sandbox | Session State |
+|---|---|---|---|
+| **Claude Code** | Persistent bash session (`bash` tool). LLM sends any shell command, state persists between calls. | OS-level (user responsibility) | Stateful — env vars, cwd, files persist |
+| **Cursor** | Terminal tool with workspace scoping. Agent runs commands freely; only asks approval for network access. | OS-level: Seatbelt (macOS), Landlock+seccomp (Linux). Workspace-scoped writes. | Stateful within workspace |
+| **OpenHands** | Docker container per session. Agent binary inside container exposes REST API. Bash + browser + Jupyter plugins. | Docker container isolation. V1 supports Docker, K8s, and local runtimes. | Stateful — full container filesystem |
+| **OpenClaw** | Single `exec` tool with host modes (sandbox, gateway, node). Foreground/background/TTY execution. | Configurable per host type. Rejects PATH/LD_* hijacking. | Stateful within workspace |
+| **Goose** | Shell tool via developer extension. Plan + execute loop. | macOS sandbox (Seatbelt). BoxLite VMs proposed. | Stateful via extension |
 
-- **Pro:** LLMs perform best when selecting from distinct tools with clear descriptions — this is the core function-calling capability
-- **Pro:** Per-CLI security rules — each CLI gets its own allowlist/blocklist
-- **Pro:** Adding a new CLI = install binary in Dockerfile + add config entry. No MCP server code changes.
-- **Pro:** Each tool's description guides the LLM on when to use it
-- **Con:** More tools registered = slightly larger tool list for the LLM to process (mitigated by clear descriptions)
+**Common pattern:** A persistent shell where the LLM has full bash (pipes, redirects, chaining), a writable workspace for intermediate results, and security via environment boundaries — not command allowlists. OpenHands, the most mature open-source agent sandbox, uses an agent binary inside the container to manage the persistent session and expose it via API.
 
-### Option 2: Single Generic Tool with CLI Parameter (rejected)
+## Production Kubernetes Patterns
 
-One `cli_execute(cli: string, args: string)` tool. The LLM passes which CLI to use as a parameter.
+Several production-grade solutions exist for running sandboxed agent execution environments on Kubernetes:
 
-- **Pro:** Simpler server code — one tool handler
-- **Con:** Tool description must cram guidance for all CLIs into one block — worse LLM tool selection
-- **Con:** No per-CLI security configuration — all CLIs share one allowlist/blocklist or need complex conditional logic
-- **Con:** Harder for agents with `custom_instructions` to reference specific tools
+| Solution | Architecture | Key Feature |
+|---|---|---|
+| **Azure Container Apps Dynamic Sessions** | Pre-warmed session pools with Hyper-V isolation. `launchShell` + `runShellCommandInRemoteEnvironment` tools. | Platform-managed sandbox with subsecond startup via warm pools |
+| **mcp-sandboxd** | Maps conversation ID to long-running Docker/K8s container. `run_sandbox` tool. | Simple session→container mapping, artifact extraction via `/artifacts` |
+| **ProDisco** | Per-session Sandbox CRD (Kata VM). gRPC proxy between MCP server and sandbox pod. | Kubernetes-native, per-session isolation, pre-configured K8s module inside sandbox |
+| **K8s Agent Sandbox** (SIG Apps) | Sandbox CRD with gVisor/Kata runtimes. Warm pools, stable identity, lifecycle management. | Official Kubernetes primitive for agent workloads (v0.2.1, March 2026) |
 
-### Option 3: Auto-Discovery + `describe_<cli>` Help Tools (rejected for now)
+These validate the per-session sandbox pod pattern and inform our design choices.
 
-Same as Option 1, but also register `describe_<cli>` tools that return `--help` output so the LLM can learn subcommands dynamically.
+## Approach
 
-- **Pro:** LLM can discover unknown subcommands (e.g., `describe_oc("adm")` to learn `oc adm` options)
-- **Pro:** Self-documenting — no need to maintain usage docs
-- **Con:** Extra LLM iterations spent on help lookups before actual commands
-- **Con:** Token cost — help output can be verbose
-- **Con:** Can be added later as an enhancement without architectural changes
+The original proposal for `cli-mcp-server` used **per-CLI MCP tools** (`execute_oc`, `execute_kubectl`) with application-level allowlists and `exec.Command()` — no shell. This approach was structurally too similar to existing structured MCP servers: different tool names, same fundamental limitations.
+
+The revised approach provides a **sandboxed exec environment** — closer to what Claude Code, Cursor, and OpenHands offer, but running in a Kubernetes pod with strong isolation.
+
+```
+Original approach (per-CLI tools):
+  TARSy → execute_oc(command, cluster) → validate allowlist → exec.Command("oc", args...) → K8s
+
+Revised approach (sandboxed exec):
+  TARSy → shell_exec(command) → sandbox pod (agent + bash + CLIs + filesystem) → K8s
+```
+
+The MCP server manages sandbox pods directly via `client-go` (create/delete in the `tarsy` namespace, where the MCP server itself is deployed). Each sandbox pod runs a lightweight Go agent binary that manages a persistent bash session and exposes it via HTTP API. The MCP server communicates with the agent via the pod's IP address (obtained from the pod status after creation) — not via the K8s exec API — giving clean structured responses (exit code, stdout, stderr, timing) and true session persistence.
 
 ## How It Relates to the Existing System
 
@@ -72,167 +94,161 @@ TARSy
  ├── mcp-server-devsandbox-actions  (structured VM lifecycle — keep as-is)
  ├── argocd-mcp-server              (structured Argo CD tools — keep as-is)
  ├── observability-mcp-server       (structured Loki/Prom tools — keep as-is)
- └── cli-mcp-server (NEW)           (generic CLI passthrough)
+ └── cli-mcp-server (NEW)           (sandboxed exec environment)
 ```
 
-The new server is additive. Agents that benefit from it (e.g., `SecurityInvestigationAgent`, `KubernetesAgent`) gain it as an additional `mcp_servers` entry in `tarsy.yaml`. Existing structured tools remain the preferred path for their specific use cases.
+The new server is additive. Agents that benefit from it gain it as an additional `mcp_servers` entry in `tarsy.yaml`. Existing structured tools remain the preferred path for their specific use cases.
 
 ### Relationship to `mcp-server-devsandbox`
 
-The `mcp-server-devsandbox` already bundles and executes `oc`, `virtctl`, and `sandboxctl` via `exec.Command()`. The difference:
-
-| | mcp-server-devsandbox | cli-mcp-server |
+| | mcp-server-devsandbox | cli-mcp-server (this) |
 |---|---|---|
-| **Tool granularity** | One tool per use case (`user-pods`, `grep-files-in-pod`) | One tool per CLI (`execute_oc`, `execute_kubectl`) |
-| **What the LLM controls** | Only tool parameters (namespace, pod name) | The full CLI command string |
-| **Adding capability** | Write Go code, add a tool, rebuild | Install binary in Dockerfile, add config |
-
-This is a **standalone repo** (`cli-mcp-server`), separate from `mcp-server-devsandbox`. The generic passthrough model has a fundamentally different security model (LLM controls the command vs LLM controls only parameters), different container image composition (bundles CLIs that structured servers don't need), and benefits from an independent release cycle.
-
-**Future direction:** As LLMs improve at CLI command construction, this server could potentially subsume `kubernetes-mcp-server` and the read-only investigation parts of `mcp-server-devsandbox` — reducing the number of MCP servers to maintain for investigation workflows. API-based servers (observability, Argo CD) and destructive-action servers would remain purpose-built.
+| **Tool model** | One tool per use case (`user-pods`, `grep-files-in-pod`) | Single `shell_exec` tool |
+| **What LLM controls** | Only tool parameters (namespace, pod name) | Full bash commands |
+| **Shell support** | No — Go `exec.Command` only | Yes — pipes, redirects, chaining |
+| **Filesystem** | Inspects existing pods | Ephemeral per-session workspace |
+| **Adding capability** | Write Go code, add a tool, rebuild | Install binary in sandbox image |
+| **Session model** | Stateless | Per-investigation sandbox pod |
 
 ### Deployment pattern
 
-Follows the established pattern used by all six existing MCP servers:
+The MCP server itself follows the established deployment pattern (kube-rbac-proxy sidecar, ServiceAccount, NetworkPolicy, TLS cert). It requires two ServiceAccounts with distinct roles:
+
+- **`cli-mcp-server` SA** — for the MCP server pod itself. Needs `system:auth-delegator` (for kube-rbac-proxy token review) and RBAC to manage sandbox pods in the `tarsy` namespace (`create`/`delete`/`list`/`get` pods).
+- **`cli-mcp-investigation-sa` SA** — for the kubeconfig mounted into sandbox pods. Read-only investigation permissions only (`view`, `list-nodes`, `kube-investigation-readonly`). No `pods/exec`, no VM lifecycle.
+
+The key difference from existing MCP servers: it also manages sandbox pods in the cluster.
 
 ```
-TARSy → (bearer token) → kube-rbac-proxy (TLS :8443) → cli-mcp-server (:8080)
-                                                              ↓
-                                                    resolve cluster → kubeconfig + context
-                                                              ↓
-                                                    exec.Command("oc", "--kubeconfig=...", args...)
-                                                              ↓
-                                                    shared kubeconfig (read-only mount) → target clusters
+TARSy
+  ↓ (bearer token)
+kube-rbac-proxy (TLS :8443)
+  ↓
+cli-mcp-server (:8080)  ← "control plane"
+  ├── /mcp       → MCP tool handlers
+  ├── /metrics   → Prometheus
+  ├── /live      → liveness
+  └── /health    → readiness
+       ↓
+  Session Manager (client-go, tarsy namespace)
+  ├── Create sandbox pod on first shell_exec
+  ├── Discover sandbox pods by label (session-id, investigation-id)
+  ├── Proxy shell commands to sandbox agent via HTTP (pod IP:8090)
+  ├── Return structured response (stdout, stderr, exit code) to LLM
+  └── Cleanup pod on session end / TTL expiry
+       ↓
+  Sandbox Pod (one per investigation session, in tarsy namespace)
+  ├── sandbox-agent (Go binary, HTTP :8090, manages persistent bash session)
+  ├── CLIs: oc, kubectl (future: helm, virtctl)
+  ├── Utils: jq, yq, grep, awk, curl
+  ├── /config/kubeconfig  (read-only mount, cli-mcp-investigation-sa)
+  ├── /workspace/         (ephemeral, writable)
+  └── NetworkPolicy: ingress from cli-mcp-server, egress to K8s API servers only
+       ↓
+  Target K8s clusters (via read-only kubeconfig)
 ```
-
-Components:
-- **kube-rbac-proxy sidecar** — TLS termination, bearer token authentication via TokenReview
-- **ServiceAccount** for the server pod — bound to `system:auth-delegator` for token review
-- **Client ServiceAccount** for TARSy — with a token secret and `ClusterRoleBinding` to the server's `nonResourceURL` access role
-- **NetworkPolicy** — restricts ingress to the pod
-- **Serving cert secret** — TLS cert for kube-rbac-proxy
 
 ## Key Concepts
 
-### CLI registry and auto-discovery
+### Sandbox pod
 
-CLIs are configured via a **static YAML config file** baked into the container image. The file can be overridden via ConfigMap mount for different environments (staging, production). Server-level settings (address, transport, kubeconfig path, stateless mode) remain CLI flags.
+An ephemeral Kubernetes pod created for each investigation session. It contains:
 
-At startup, the server reads the config, checks which binaries exist, and registers MCP tools for available CLIs. Each CLI entry specifies:
+- **Sandbox agent** — a lightweight Go HTTP server (~200-300 lines) that manages a persistent bash session. The pod's entrypoint. Accepts commands via HTTP, returns structured JSON responses (stdout, stderr, exit code, execution time). This is the same pattern used by OpenHands (agent binary inside container).
+- **Pre-installed CLIs** — `oc`, `kubectl`, and future CLIs. The Dockerfile for the sandbox image controls what's available.
+- **Unix utilities** — `jq`, `yq`, `grep`, `awk`, `sort`, `wc`, `curl` (internal-only network). These make the LLM productive — it can pipe, filter, and transform output the same way a developer would.
+- **Ephemeral workspace** — `/workspace` is an `emptyDir` volume. The LLM can write intermediate files during an investigation. Everything is destroyed when the pod is deleted.
+- **Read-only kubeconfig** — mounted from a kubeconfig secret scoped to the dedicated investigation ServiceAccount. Contains contexts for all target clusters.
+- **Pod security** — non-root, drop all capabilities, no privilege escalation. Resource limits (CPU/memory) enforced.
 
-- **Name** — used in tool naming (`execute_<name>`)
-- **Binary path** — filesystem path to the executable
-- **Description** — MCP tool description that guides the LLM on when to use this CLI
-- **Environment variables** — optional per-CLI env vars (for future CLIs that need them)
-- **Security rules** — allowed verbs/subcommands and blocked patterns (see Security Model below)
+Adding a future CLI means installing the binary in the sandbox image. No server code changes.
 
-The server also discovers available clusters from a shared kubeconfig at startup. Each tool call requires a `cluster` parameter — the server resolves the cluster to a kubeconfig path and context, and injects `--kubeconfig` and `--context` flags automatically.
+### Sandbox agent
 
-Only CLIs whose binary is found on the filesystem at startup are registered. This means the Dockerfile controls what's available — remove a binary and the tool disappears.
+The lightweight Go binary running inside each sandbox pod. It:
 
-### Tool interface
+1. Starts an HTTP server on a fixed port (e.g., `:8090`)
+2. On first request, spawns a persistent `bash` process
+3. For each command request, pipes the command to bash's stdin, captures stdout/stderr
+4. Returns a structured JSON response: `{"stdout": "...", "stderr": "...", "exit_code": 0, "duration_ms": 123}`
+5. Maintains session state naturally — env vars, working directory, and aliases persist because the bash process stays alive
+6. Exposes a `/health` endpoint for readiness checks
 
-Each registered CLI exposes one MCP tool with a simple schema:
+The agent is simple by design. It doesn't implement security filtering, cluster resolution, or output truncation — those concerns belong in the MCP server or the sandbox boundary. The agent just runs commands and returns results.
+
+### Session manager
+
+The component inside `cli-mcp-server` that manages sandbox pod lifecycle:
+
+1. **Create** — on first `shell_exec` call for a session, creates a sandbox pod from a pod template via `client-go` in the `tarsy` namespace. Labels the pod with the `session_id` provided by the LLM (typically TARSy's investigation ID) and creation timestamp. Records the pod IP from the pod status for agent communication.
+2. **Discover** — finds sandbox pods by label. Uses an in-memory cache (TTL ~30s) to avoid per-request K8s API calls. On MCP server restart, rediscovers all active sandbox pods by label in a single list call and rebuilds the pod IP cache.
+3. **Execute** — sends the shell command to the sandbox agent's HTTP API (`http://<pod-ip>:8090/exec`) and returns the structured response. Output is truncated at the MCP server level (100KB) to keep the agent simple.
+4. **Cleanup** — deletes the sandbox pod when the session ends (TARSy signals completion) or the TTL expires (idle timeout). If the sandbox agent crashes, the pod restarts (standard K8s restart policy) and a new bash session begins — the MCP server detects this via the agent's `/health` endpoint and informs the LLM that session state was reset.
+
+Pod labels are the source of truth for session→pod mapping. This keeps the MCP server stateless — any replica can serve any request, and restarts don't lose session routing.
+
+### MCP tool: `shell_exec`
+
+A single MCP tool that gives the LLM full bash access in the sandbox:
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `command` | string | yes | Shell command to execute (full bash — pipes, redirects, chaining supported) |
+| `session_id` | string | yes | Session identifier for sandbox pod routing (typically the investigation ID) |
+| `timeout` | int | no | Max execution time in seconds (default 60, max 300) |
+
+The LLM writes bash commands the same way a developer would. Multi-cluster targeting uses `--context=<cluster>` per command — explicit, self-documenting, and supports cross-cluster investigation naturally:
 
 ```
-Tool: execute_<cli_name>
-Parameters:
-  - command (string, required): The CLI command arguments (e.g., "get pods -n foo -o json")
-  - cluster (string, required): Target cluster name (e.g., "rm1")
-  - timeout (int, optional): Max execution time in seconds (default from config, max from config)
+shell_exec("oc get clusteroperators --context=rm1")
+shell_exec("oc get pods -n openshift-ingress --context=rm1 -o json | jq '.items[] | {name: .metadata.name, ready: .status.containerStatuses[0].ready}'")
+shell_exec("oc adm top nodes --context=rm1 --sort-by=cpu | head -5")
+shell_exec("diff <(oc get pods --context=rm1 -o name) <(oc get pods --context=rm2 -o name)")
+shell_exec("export CTX=rm1; for ns in $(oc get ns --context=$CTX -o name | head -10); do echo \"=== $ns ===\"; oc get pods --context=$CTX -n ${ns#namespace/} --no-headers 2>/dev/null | wc -l; done")
 ```
 
-The `command` parameter is a single string — the LLM writes CLI commands naturally. The `cluster` parameter specifies the target cluster; the server resolves it to a kubeconfig path and context, then auto-injects `--kubeconfig` and `--context` flags (same pattern as `mcp-server-devsandbox`'s `RunOcOnBytes`). The LLM never manages kubeconfig details. This matches the `alexei-led/k8s-mcp-server` pattern. The command string is parsed via `strings.Fields()` for security validation and passed to `exec.Command()`.
+Working directory and environment variables persist between calls within the same session — maintained by the persistent bash process in the sandbox agent.
 
-### How the LLM decides which CLI to use
-
-Three layers of guidance, all part of the existing TARSy architecture:
-
-1. **MCP tool descriptions** — each `execute_<cli>` tool has a detailed description explaining when to use it:
-   - `execute_oc`: "Use for OpenShift-specific resources, `oc adm` commands, and any standard K8s operations on OpenShift clusters"
-   - `execute_kubectl`: "Use for standard Kubernetes operations. Prefer `execute_oc` on OpenShift clusters."
-
-2. **Server instructions** — the `instructions` field in `tarsy.yaml`'s `mcp_servers` config provides overall guidance (including available cluster names)
-
-3. **Agent instructions** — each agent's `custom_instructions` can specify preferences ("use `oc` for cluster investigation")
-
-> **Future CLIs:** Adding e.g. `execute_virtctl` or `execute_helm` follows the same pattern — install binary, add config entry, update tool descriptions.
+**Note on future write capabilities:** If the server later adds write-capable CLIs (e.g., `helm install`, `oc apply`), per-cluster sandbox pods should be considered. With write access, targeting the wrong cluster has destructive consequences, and per-cluster isolation eliminates that risk. For read-only investigation, a shared kubeconfig with all contexts is safe.
 
 ## Security Model
 
-Security is enforced at **five layers**, matching and extending the patterns used by existing MCP servers.
+Security comes from the sandbox boundary, not from application-level command filtering. No allowlists, no blocklists. This matches how production sandbox environments (Cursor, OpenHands, Azure Container Apps) enforce safety.
 
-### Layer 1: Kubernetes RBAC (primary boundary)
+### Layer 1: Kubernetes RBAC (hard boundary)
 
-The kubeconfig mounted into the container uses a ServiceAccount with strictly scoped permissions. This is the **hard security boundary** — even if the LLM constructs a destructive command, the API server rejects it with 403.
+The kubeconfig mounted into the sandbox pod uses a **dedicated ServiceAccount** (`cli-mcp-investigation-sa`) with only investigation-relevant ClusterRoles:
 
-Existing RBAC for investigation (already deployed):
 - `view` ClusterRole — standard K8s read-only for namespaced resources (explicitly excludes Secrets)
 - `list-nodes` ClusterRole — node/machine listing
 - `kube-investigation-readonly` ClusterRole — cluster-scoped reads (namespaces, PVs, CRDs, metrics, OpenShift operators, machine configs)
 
-The server reuses the existing `sandbox-mcp-sa` ServiceAccount and kubeconfig. This SA is already bound to `view` + `kube-investigation-readonly`, providing the right read-only boundary.
+This SA explicitly **does not** include `pods/exec` or KubeVirt lifecycle permissions (which are present on `sandbox-mcp-sa` for `mcp-server-devsandbox`). Since the sandbox gives the LLM full shell access with no allowlist, the SA must be tightly scoped — the LLM can exercise any permission the SA has.
 
-**Over-privilege note:** The current `sandbox-mcp-sa` also has `pods/exec` and KubeVirt lifecycle permissions (needed by `mcp-server-devsandbox`, not by this server). These are mitigated by application-level command blocking. If audit separation or compliance requires it, a dedicated SA with a trimmed ClusterRole can be introduced later — only the kubeconfig secret mount changes, no architectural impact.
+### Layer 2: Pod isolation
 
-### Layer 2: Application-level command filtering
+Each investigation gets its own sandbox pod. No cross-session filesystem access. No shared state between investigations.
 
-Per-CLI allowlists and blocklists enforced before command execution.
+### Layer 3: Network isolation
 
-Filtering uses an **allowlist + blocklist** model (belt and suspenders). The allowlist defines which top-level verbs are permitted. The blocklist catches specific dangerous patterns within those allowed verbs. Unknown verbs are denied by default.
+A `NetworkPolicy` on sandbox pods enforces:
+- **Ingress:** allow only from `cli-mcp-server` pods (so the MCP server can reach the sandbox agent's HTTP port)
+- **Egress:** allow only to the Kubernetes API servers of target clusters. No internet access. No access to other services unless explicitly needed.
 
-Example configuration:
+This prevents data exfiltration, limits blast radius, and ensures sandbox pods are only reachable by the MCP server.
 
-```yaml
-clis:
-  - name: oc
-    security:
-      allowed_verbs:
-        - get
-        - describe
-        - logs
-        - status
-        - adm
-        - explain
-        - api-resources
-        - whoami
-        - version
-      blocked_patterns:
-        - "adm drain"
-        - "adm cordon"
-        - "adm uncordon"
-        - "adm taint"
-        - "adm migrate"
-```
+### Layer 4: Ephemeral storage
 
-In this example, `get`, `describe`, `logs`, etc. are straightforward read verbs. `adm` is broadly allowed (so `adm top nodes`, `adm top pods`, `adm inspect` all work), but specific dangerous `adm` subcommands are blocked. Any verb not in the allowlist (e.g., `delete`, `apply`, `create`, `exec`) is rejected before it reaches the API server.
+The `/workspace` filesystem is an `emptyDir` — it dies with the pod. No persistent state between investigations. No data leakage across sessions.
 
-**Note:** The team may choose to simplify to allowlist-only if the flexibility of broad verbs isn't needed.
+### Layer 5: Resource limits and TTL
 
-### Layer 3: No shell interpretation
-
-All commands are executed via Go's `exec.Command(binary, args...)` — never through `sh -c`. This eliminates:
-- Pipe injection (`; rm -rf /`)
-- Command chaining (`&& curl evil.com`)
-- Backtick/subshell substitution (`` `whoami` ``)
-- Glob expansion in unintended contexts
-
-This matches the existing pattern in `mcp-server-devsandbox`'s `OsCommandExecutor`. Piped commands are not supported — the LLM uses built-in CLI output format flags (`-o jsonpath`, `-o go-template`, `--sort-by`, `--field-selector`, `-o custom-columns`) for output filtering, and makes multiple sequential tool calls for cross-resource correlation. Pipe support can be added later (allowlisted pipe targets) if needed without architectural changes.
-
-### Layer 4: Container-level isolation
-
-Standard pod security (same as all existing MCP servers):
-- `runAsNonRoot: true`
-- `readOnlyRootFilesystem: true` (where feasible)
-- `capabilities: drop: [ALL]`
-- `allowPrivilegeEscalation: false`
-
-### Layer 5: Output controls
-
-- **Timeout** — kill commands after a configurable max (default 60s) to prevent hangs (e.g., `oc logs -f`)
-- **Output truncation** — cap response size (e.g., 100KB) to prevent token explosion
-- **Data masking** — TARSy's `data_masking` config scrubs tokens, certs, emails from tool responses (already in place for all MCP servers)
-- **Summarization** — TARSy's `summarization` config compresses large responses (already in place)
+- **Resource limits** — CPU/memory limits per sandbox pod prevent resource abuse
+- **TTL** — pods auto-deleted after configurable idle timeout (e.g., 30 minutes)
+- **Output truncation** — command output capped at 100KB to prevent token explosion
+- **Command timeout** — individual commands killed after configurable max (default 60s, max 300s)
+- **Data masking** — TARSy's existing `data_masking` config scrubs tokens, certs, emails
+- **Summarization** — TARSy's existing `summarization` config compresses large responses
 
 ## TARSy Integration
 
@@ -248,21 +264,16 @@ mcp_servers:
       timeout: 90
       verify_ssl: false
     instructions: |
-      This server provides generic CLI access for cluster investigation.
+      This server provides a sandboxed shell environment for cluster investigation.
+      You have full bash access: pipes, redirects, chaining, and standard Unix tools (jq, grep, awk).
       Available CLIs: oc, kubectl.
-      Available clusters: rm1, rm2, rm3 (specify cluster name in each tool call).
-      Use this when existing structured tools don't cover your investigation needs.
-      Prefer structured tools (kubernetes-server, devsandbox-mcp-server) for standard operations.
-      All access is read-only — destructive commands will be rejected.
+      Available clusters: rm1, rm2, rm3. Use --context=<cluster> to target a specific cluster.
+      Your workspace at /workspace is ephemeral — use it for intermediate files during investigation.
+      All cluster access is read-only via RBAC.
     data_masking:
       enabled: true
-      pattern_groups:
-        - "kubernetes"
-        - "security"
-      patterns:
-        - "certificate"
-        - "token"
-        - "email"
+      pattern_groups: ["kubernetes", "security"]
+      patterns: ["certificate", "token", "email"]
     summarization:
       enabled: true
       summary_max_token_limit: 1200
@@ -270,58 +281,27 @@ mcp_servers:
 
 ### Agent wiring
 
-Added to investigation agents that benefit from flexible CLI access:
+Added to investigation agents that benefit from flexible CLI access. Which agents get access is a TARSy configuration decision — the `mcp_servers` list per agent in `tarsy.yaml`. The server has no knowledge of which agent is calling it.
 
-```yaml
-agents:
-  SecurityInvestigationAgent:
-    mcp_servers:
-      - "kubernetes-server"
-      - "devsandbox-mcp-server"
-      - "observability-mcp-server"
-      - "cli-mcp-server"              # NEW
-```
+## Technology
 
-Which agents get access is a TARSy configuration decision (the `mcp_servers` list per agent in `tarsy.yaml`), not an MCP server design decision. The server itself has no knowledge of which agent is calling it. This can be decided at deployment time.
-
-## Technology and Implementation
-
-### Language and frameworks
-
-- **Go** — consistent with all existing MCP servers (`mcp-server-devsandbox`, `argocd-mcp`, `devsandbox-observability-mcp`)
-- **`github.com/modelcontextprotocol/go-sdk/mcp`** — same MCP SDK
+- **Go** — consistent with all existing MCP servers
+- **`github.com/modelcontextprotocol/go-sdk/mcp`** — MCP SDK
 - **`github.com/codeready-toolchain/mcp-common`** — shared metrics/logging middleware
 - **`github.com/spf13/cobra`** — CLI flag parsing
+- **`k8s.io/client-go`** — Kubernetes client for sandbox pod management (create, delete, list)
 
-### Container image
+Two binaries in the same repo, two container images:
+- `cmd/cli-mcp-server/` — the MCP server (control plane). Image: multi-stage Go build, standard deployment with kube-rbac-proxy sidecar.
+- `cmd/sandbox-agent/` — the lightweight agent running inside sandbox pods. Image: `quay.io/codeready-toolchain/oc-client-base-minimal` base + agent binary + Unix utilities (jq, yq, grep, awk, curl).
 
-Multi-stage Go build, runtime image bundles all CLI binaries:
-
-```dockerfile
-FROM golang:1.24-alpine AS builder
-# ... build the Go binary ...
-
-FROM quay.io/codeready-toolchain/oc-client-base-minimal
-# oc is already in the base image; kubectl is symlinked to oc
-COPY --from=builder /workspace/bin/cli-mcp-server /usr/bin/
-```
-
-Adding a future CLI = add its install step to the Dockerfile + a config entry. No server code changes.
-
-### Shared infrastructure with mcp-server-devsandbox
-
-The server imports `mcp-common` for metrics and logging middleware. Command execution is implemented locally — the executor has CLI-specific concerns (security validation, timeout, output truncation) that don't belong in a shared library.
-
-Reusable components from the existing ecosystem:
-- `mcp-common` — Prometheus metrics middleware, logging middleware
-- Deployment manifests — kube-rbac-proxy sidecar, ServiceAccount/RBAC, NetworkPolicy, TLS secrets
-- `OsCommandExecutor` pattern — `exec.Command()` with env var support
+Both deployed in the `tarsy` namespace.
 
 ## What Is Out of Scope
 
-- **Replacing existing structured MCP servers** — this is additive, not a replacement
-- **Write/mutate operations** — this server is read-only by design; destructive use cases belong in purpose-built tools with explicit safeguards
-- **Shell interpretation or piped commands** — no `sh -c` execution
-- **Interactive commands** — no `oc exec -it`, `oc edit`, or anything requiring stdin
-- **Custom output parsing** — the server returns raw CLI output; TARSy's summarization handles compression
-- **Multi-tenancy / per-user credentials** — uses shared kubeconfig (per-user auth is handled by the token exchange proposal when implemented)
+- **Replacing existing structured MCP servers** — this is additive
+- **Write/mutate operations against clusters** — read-only investigation by design (RBAC-enforced)
+- **Interactive commands requiring stdin** — no `oc edit`, no interactive `oc exec -it`
+- **Multi-tenancy / per-user credentials** — uses shared kubeconfig (per-user auth is a separate proposal)
+- **Warm pod pools** — can be added later if cold start latency is a problem in practice
+- **Custom output parsing** — the server returns raw shell output; TARSy's summarization handles compression
