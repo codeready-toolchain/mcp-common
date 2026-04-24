@@ -6,9 +6,9 @@
 
 ## Overview
 
-A Go MCP server that provides TARSy investigation agents with a **sandboxed execution environment** — a per-investigation Kubernetes pod where the LLM has a persistent bash shell with full CLI access. The server exposes two MCP tools — `shell_exec` (command execution) and `session_end` (cleanup) — manages sandbox pod lifecycle via `client-go`, and proxies commands to a lightweight agent binary running inside each pod.
+A Go MCP server that provides TARSy investigation agents with a **sandboxed execution environment** — a per-investigation Kubernetes pod where the LLM has a persistent bash shell with full CLI access. The server exposes two MCP tools — `bash` (command execution) and `session_end` (cleanup) — manages sandbox pod lifecycle via `client-go`, and proxies commands to a lightweight agent binary running inside each pod.
 
-The server runs in **stateless mode** (`--stateless`), consistent with all other MCP servers. Session routing uses an explicit `session_id` parameter in every tool call, with Kubernetes pod labels as the source of truth. Any MCP server replica can serve any request — no sticky sessions, no shared state.
+The server runs in **stateless mode** (`--stateless`), consistent with all other MCP servers. Session routing uses the `X-Session-ID` HTTP header, injected automatically by TARSy on every MCP request, with Kubernetes pod labels as the source of truth. The LLM never sees or manages session IDs. Any MCP server replica can serve any request — no sticky sessions, no shared state.
 
 **Initial scope:** `oc`, `kubectl`, and standard Unix utilities (`jq`, `yq`, `grep`, `awk`, `curl`). The sandbox image is extensible to additional CLIs by installing binaries — no server code changes.
 
@@ -26,48 +26,48 @@ The server runs in **stateless mode** (`--stateless`), consistent with all other
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  Pod: cli-mcp-server (Deployment, N replicas)                          │
+│  Pod: cli-mcp-server (Deployment, N replicas)                           │
 │                                                                         │
-│  ┌─────────────────┐     ┌────────────────────────────────────────────┐ │
+│  ┌──────────────────┐     ┌───────────────────────────────────────────┐ │
 │  │ kube-rbac-proxy  │     │ cli-mcp-server (main container)           │ │
-│  │                  │     │                                            │ │
+│  │                  │     │                                           │ │
 │  │  TLS :8443 ──────┼────▶│  :8080                                    │ │
-│  │  TokenReview     │     │                                            │ │
+│  │  TokenReview     │     │                                           │ │
 │  │  Bearer auth     │     │  ┌──────────┐  ┌───────────────────────┐  │ │
 │  │                  │     │  │ MCP SDK  │  │ Session Manager       │  │ │
 │  │                  │     │  │ Server   │  │                       │  │ │
-│  └─────────────────┘     │  │          │  │ Create pod (client-go)│  │ │
+│  └──────────────────┘     │  │          │  │ Create pod (client-go)│  │ │
 │                           │  │ /mcp     │──▶ Discover by label     │  │ │
 │                           │  │ /metrics │  │ Proxy to agent HTTP   │  │ │
 │                           │  │ /live    │  │ Cleanup on end/TTL    │  │ │
 │                           │  │ /health  │  │                       │  │ │
 │                           │  └──────────┘  └───────────────────────┘  │ │
-│                           │                        │                   │ │
-│                           └────────────────────────┼───────────────────┘ │
-│                                                    │                     │
-└────────────────────────────────────────────────────┼─────────────────────┘
+│                           │                        │                  │ │
+│                           └────────────────────────┼──────────────────┘ │
+│                                                    │                    │
+└────────────────────────────────────────────────────┼────────────────────┘
                                                      │ HTTP (pod IP:8090)
                                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  Pod: cli-mcp-sandbox-<session-id> (one per investigation)             │
+│  Pod: cli-mcp-sandbox-<session-id> (one per investigation)              │
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │ sandbox-agent (Go binary, HTTP :8090)                           │    │
-│  │                                                                  │    │
+│  │                                                                 │    │
 │  │  POST /exec   → pipe command to persistent bash, return result  │    │
-│  │  GET  /health → readiness check                                  │    │
-│  │                                                                  │    │
-│  │  Persistent bash process (stdin/stdout/stderr pipes)             │    │
+│  │  GET  /health → readiness check                                 │    │
+│  │                                                                 │    │
+│  │  Persistent bash process (stdin/stdout/stderr pipes)            │    │
 │  └─────────────────────────────────────────────────────────────────┘    │
 │                                                                         │
-│  CLIs: oc, kubectl          Unix: jq, yq, grep, awk, curl              │
+│  CLIs: oc, kubectl          Unix: jq, yq, grep, awk, curl               │
 │  /config/kubeconfig (ro)    /workspace/ (emptyDir, writable)            │
 │                                                                         │
 │  Labels: tarsy.redhat.com/session-id=<id>                               │
 │          tarsy.redhat.com/component=cli-mcp-sandbox                     │
 │                                                                         │
 │  NetworkPolicy: ingress from cli-mcp-server only                        │
-│                 egress to K8s API servers only                           │
+│                 egress to K8s API servers only                          │
 └─────────────────────────────────────────────────────────────────────────┘
                      │
                      ▼
@@ -76,15 +76,15 @@ The server runs in **stateless mode** (`--stateless`), consistent with all other
 
 ### Request flow
 
-1. TARSy sends `tools/call` with tool `shell_exec` and params `{"command": "oc get pods -n foo --context=rm1", "session_id": "inv-abc123"}`
+1. TARSy sends `tools/call` with tool `bash` and params `{"command": "oc get pods -n foo --context=rm1"}` — the `X-Session-ID: inv-abc123` header is automatically attached by TARSy's MCP client
 2. kube-rbac-proxy validates the bearer token via TokenReview, forwards to `:8080`
-3. MCP SDK dispatches to the registered `shell_exec` handler
+3. MCP SDK dispatches to the registered `bash` handler, which extracts the session ID from `req.Extra.Header.Get("X-Session-ID")`
 4. Session manager looks up pod by label `tarsy.redhat.com/session-id=inv-abc123`
    - **Cache hit:** use cached pod IP
    - **Cache miss:** query K8s API for pods with that label. If found, cache and use. If not found, create new sandbox pod, wait for ready, cache pod IP.
 5. HTTP POST to `http://<pod-ip>:8090/exec` with `{"command": "oc get pods -n foo --context=rm1", "timeout": 60}`
 6. Sandbox agent pipes command to persistent bash, captures stdout/stderr, returns JSON response
-7. MCP server truncates output if needed (100KB limit), returns `mcp.CallToolResult` to TARSy
+7. MCP server returns `mcp.CallToolResult` to TARSy as-is. Output treatment (summarization, masking) is TARSy's responsibility.
 
 ## Core Concepts
 
@@ -92,32 +92,34 @@ The server runs in **stateless mode** (`--stateless`), consistent with all other
 
 The MCP server runs in **stateless mode** (`Stateless: true` in `StreamableHTTPOptions`), consistent with all other MCP servers (`mcp-server-devsandbox`, `kubernetes-mcp-server`, etc.). This enables multi-replica deployment behind a load balancer with no sticky sessions.
 
-Session identification uses an **explicit `session_id` parameter** in every `shell_exec` call. The calling agent (TARSy) passes its investigation ID as the `session_id`. This keeps the MCP server truly stateless — it doesn't track sessions at the transport layer, and any replica can serve any request by looking up the pod via Kubernetes labels.
+Session identification uses the **`X-Session-ID` HTTP header**, injected automatically by TARSy's MCP client on every request. TARSy sets this to the investigation ID. The LLM never sees or manages session IDs — they are not tool parameters. This eliminates an entire class of LLM errors (hallucinated IDs, typos, inconsistent values across calls) while keeping the MCP server truly stateless — any replica can serve any request by looking up the pod via Kubernetes labels.
 
-**Why explicit parameter instead of SDK session ID:** The MCP SDK's stateful mode tracks sessions in memory, requiring sticky sessions or shared state for multi-replica deployments. Since all other MCP servers run stateless, and the sketch mandates "pod labels are the source of truth," an explicit parameter is the natural fit. It's also more debuggable — the session routing is visible in every tool call, not hidden in transport headers.
+On the server side, each tool handler extracts the session ID from the MCP SDK's `RequestExtra.Header` — a first-class SDK capability where `StreamableHTTPHandler` populates the full `http.Header` from each incoming request.
 
-### MCP tool: `shell_exec`
+### MCP tool: `bash`
+
+Named after Claude Code's `bash` tool — the pattern LLMs are most trained on. Avoids collision with `exec` (which in K8s/Docker means "attach to a running container").
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `command` | string | yes | Shell command to execute (full bash — pipes, redirects, chaining) |
-| `session_id` | string | yes | Session identifier (typically the TARSy investigation ID) |
 | `timeout` | int | no | Max execution time in seconds (default 60, max 300) |
 
+Session routing is handled transparently via the `X-Session-ID` HTTP header — the LLM never needs to manage session identity.
+
 ```go
-type ShellExecInput struct {
-    Command   string `json:"command" jsonschema:"required,description=Shell command to execute (full bash — pipes, redirects, chaining supported)"`
-    SessionID string `json:"session_id" jsonschema:"required,description=Session identifier for sandbox pod routing (typically the investigation ID)"`
-    Timeout   *int   `json:"timeout,omitempty" jsonschema:"description=Max execution time in seconds (default 60, max 300)"`
+type BashInput struct {
+    Command string `json:"command" jsonschema:"required,description=Shell command to execute (full bash — pipes, redirects, chaining supported)"`
+    Timeout *int   `json:"timeout,omitempty" jsonschema:"description=Max execution time in seconds (default 60, max 300)"`
 }
 ```
 
-Example calls (TARSy investigation `inv-abc123`):
+Example calls:
 
 ```
-shell_exec(command="oc get clusteroperators --context=rm1", session_id="inv-abc123")
-shell_exec(command="oc get pods -n openshift-ingress --context=rm1 -o json | jq '.items[] | {name: .metadata.name, ready: .status.containerStatuses[0].ready}'", session_id="inv-abc123")
-shell_exec(command="diff <(oc get pods --context=rm1 -o name) <(oc get pods --context=rm2 -o name)", session_id="inv-abc123")
+bash(command="oc get clusteroperators --context=rm1")
+bash(command="oc get pods -n openshift-ingress --context=rm1 -o json | jq '.items[] | {name: .metadata.name, ready: .status.containerStatuses[0].ready}'")
+bash(command="diff <(oc get pods --context=rm1 -o name) <(oc get pods --context=rm2 -o name)")
 ```
 
 Working directory and environment variables persist between calls within the same session — maintained by the persistent bash process in the sandbox agent.
@@ -158,8 +160,7 @@ type SandboxConfig struct {
    - Calls `GetOrCreatePod` for the pod IP
    - HTTP POST to `http://<pod-ip>:8090/exec`
    - Updates `tarsy.redhat.com/last-activity` annotation on the pod (patch via `client-go`)
-   - Returns structured response (stdout, stderr, exit code, duration)
-   - Truncates output at 100KB at the MCP server level
+   - Returns structured response as-is (stdout, stderr, exit code, duration)
 
 3. **CleanupSession(sessionID)** — deletes the sandbox pod
    - Called when session ends (via `session_end` tool or TTL expiry)
@@ -277,7 +278,7 @@ The reader goroutines scan for the delimiter markers in stdout and stderr. Stdou
 
 **Crash recovery:** If the bash process dies (OOM, signal), the agent detects this when the pipe read returns `io.EOF` or the process `Wait()` returns. On the next `/exec` request, it respawns a new bash process and returns the command result with `stderr` containing `"[session state was reset — previous bash process exited]"`. The `/health` endpoint returns 503 if bash is dead and not yet respawned.
 
-**The agent is simple by design.** It doesn't implement security filtering, output truncation, or session routing — those concerns belong in the MCP server or the sandbox boundary.
+**The agent is simple by design.** It doesn't implement security filtering or session routing — those concerns belong in the MCP server or the sandbox boundary.
 
 ### Session cleanup
 
@@ -285,20 +286,22 @@ Two mechanisms work together:
 
 **1. Explicit `session_end` tool (primary):**
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `session_id` | string | yes | Session to terminate |
+No parameters — the session ID is extracted from the `X-Session-ID` HTTP header, same as `bash`.
 
-The LLM calls `session_end(session_id="inv-abc123")` when the investigation is complete. The handler deletes the sandbox pod by label and removes the cache entry. Returns a confirmation message.
+The LLM calls `session_end()` when the investigation is complete. The handler extracts the session ID from the header, deletes the sandbox pod by label, and removes the cache entry. Returns a confirmation message.
 
 ```go
-func (h *SessionEndHandler) Handle(ctx context.Context, req *mcp.CallToolRequest, input SessionEndInput) (*mcp.CallToolResult, error) {
-    if err := h.sessions.CleanupSession(ctx, input.SessionID); err != nil {
+func (h *SessionEndHandler) Handle(ctx context.Context, req *mcp.ServerRequest[mcp.CallToolParams]) (*mcp.CallToolResult, error) {
+    sessionID := req.Extra.Header.Get("X-Session-ID")
+    if sessionID == "" {
+        return nil, fmt.Errorf("missing X-Session-ID header")
+    }
+    if err := h.sessions.CleanupSession(ctx, sessionID); err != nil {
         return nil, fmt.Errorf("failed to end session: %w", err)
     }
     return &mcp.CallToolResult{
         Content: []mcp.Content{
-            mcp.TextContent{Text: fmt.Sprintf("Session %s ended. Sandbox pod deleted.", input.SessionID)},
+            mcp.TextContent{Text: fmt.Sprintf("Session %s ended. Sandbox pod deleted.", sessionID)},
         },
     }, nil
 }
@@ -308,7 +311,7 @@ TARSy's instructions include: *"Call session_end when your investigation is comp
 
 **2. TTL safety net (fallback):**
 
-A periodic cleanup goroutine (runs every 5 minutes) lists all sandbox pods and deletes any that have been idle beyond `--idle-timeout` (default 30 minutes). Idle time is determined by the `tarsy.redhat.com/last-activity` annotation, which the session manager updates on every `shell_exec` call.
+A periodic cleanup goroutine (runs every 5 minutes) lists all sandbox pods and deletes any that have been idle beyond `--idle-timeout` (default 30 minutes). Idle time is determined by the `tarsy.redhat.com/last-activity` annotation, which the session manager updates on every `bash` call.
 
 This catches edge cases: LLM crash, TARSy process killed, agent forgetting to call `session_end`.
 
@@ -449,58 +452,39 @@ func (m *SessionManager) buildPodSpec(sessionID string) *corev1.Pod {
 
 ### Output handling
 
-Command output flows through two stages:
-
-1. **Sandbox agent** — captures raw stdout/stderr from the bash process. No truncation at this level — the agent is kept simple.
-2. **MCP server** — truncates combined output at 100KB before returning to TARSy. If truncated, prepends a notice:
-
-```go
-const maxOutputBytes = 100 * 1024
-
-func truncateOutput(stdout, stderr string) (string, string, bool) {
-    combined := len(stdout) + len(stderr)
-    if combined <= maxOutputBytes {
-        return stdout, stderr, false
-    }
-    // Prioritize stdout, keep some stderr for errors
-    maxStdout := maxOutputBytes * 80 / 100
-    maxStderr := maxOutputBytes * 20 / 100
-    if len(stdout) > maxStdout {
-        stdout = stdout[:maxStdout] + "\n[output truncated at 80KB]"
-    }
-    if len(stderr) > maxStderr {
-        stderr = stderr[:maxStderr] + "\n[stderr truncated at 20KB]"
-    }
-    return stdout, stderr, true
-}
-```
-
-TARSy's existing `data_masking` and `summarization` configs handle post-truncation processing (token scrubbing, token-limit compression).
+The MCP server returns command output **as-is** — no truncation, no transformation. Output treatment (data masking, summarization, token compression) is TARSy's responsibility, handled by its existing `data_masking` and `summarization` configs per MCP server.
 
 ### Tool handler
 
-The `shell_exec` handler ties together session management, command proxying, and output handling:
+The `bash` handler ties together session extraction, session management, and command proxying:
 
 ```go
-func (h *ShellExecHandler) Handle(ctx context.Context, req *mcp.CallToolRequest, input ShellExecInput) (*mcp.CallToolResult, error) {
+func (h *BashHandler) Handle(ctx context.Context, req *mcp.ServerRequest[mcp.CallToolParams]) (*mcp.CallToolResult, error) {
+    sessionID := req.Extra.Header.Get("X-Session-ID")
+    if sessionID == "" {
+        return nil, fmt.Errorf("missing X-Session-ID header")
+    }
+
+    var input BashInput
+    if err := json.Unmarshal(req.Params.Arguments, &input); err != nil {
+        return nil, fmt.Errorf("invalid arguments: %w", err)
+    }
+
     timeout := 60
     if input.Timeout != nil && *input.Timeout > 0 {
         timeout = min(*input.Timeout, 300)
     }
 
-    result, err := h.sessions.ExecuteCommand(ctx, input.SessionID, input.Command, timeout)
+    result, err := h.sessions.ExecuteCommand(ctx, sessionID, input.Command, timeout)
     if err != nil {
         return nil, fmt.Errorf("sandbox exec failed: %w", err)
     }
 
-    stdout, stderr, truncated := truncateOutput(result.Stdout, result.Stderr)
-
-    output := ShellExecOutput{
-        Stdout:     stdout,
-        Stderr:     stderr,
+    output := BashOutput{
+        Stdout:     result.Stdout,
+        Stderr:     result.Stderr,
         ExitCode:   result.ExitCode,
         DurationMs: result.DurationMs,
-        Truncated:  truncated,
     }
 
     jsonBytes, _ := json.Marshal(output)
@@ -575,7 +559,7 @@ func main() {
 1. Creates Kubernetes clientset (in-cluster config — the MCP server runs in K8s)
 2. Creates `SessionManager` with sandbox config
 3. Creates `mcp.Server` with `mcp-common` middleware (metrics, logging)
-4. Registers `shell_exec` and `session_end` tools
+4. Registers `bash` and `session_end` tools
 5. Starts stale pod cleanup goroutine
 6. Sets up HTTP mux with `/mcp`, `/metrics`, `/live`, `/health`
 7. Signal handling for graceful shutdown
@@ -587,23 +571,21 @@ func main() {
 ```go
 // --- MCP server types ---
 
-type ShellExecInput struct {
-    Command   string `json:"command" jsonschema:"required,description=Shell command to execute"`
-    SessionID string `json:"session_id" jsonschema:"required,description=Session identifier for sandbox routing"`
-    Timeout   *int   `json:"timeout,omitempty" jsonschema:"description=Max execution time in seconds (default 60)"`
+type BashInput struct {
+    Command string `json:"command" jsonschema:"required,description=Shell command to execute"`
+    Timeout *int   `json:"timeout,omitempty" jsonschema:"description=Max execution time in seconds (default 60)"`
 }
 
-type ShellExecOutput struct {
+// Session ID is extracted from the X-Session-ID HTTP header, not from tool params.
+
+type BashOutput struct {
     Stdout     string `json:"stdout"`
     Stderr     string `json:"stderr"`
     ExitCode   int    `json:"exit_code"`
     DurationMs int64  `json:"duration_ms"`
-    Truncated  bool   `json:"truncated,omitempty"`
 }
 
-type SessionEndInput struct {
-    SessionID string `json:"session_id" jsonschema:"required,description=Session to terminate"`
-}
+// session_end has no input params — session ID comes from the X-Session-ID header.
 
 // --- Sandbox agent types (shared contract) ---
 
@@ -648,8 +630,8 @@ cli-mcp-server/
 │   │   ├── server.go              # MCP server setup, middleware, endpoints
 │   │   └── server_test.go
 │   └── tools/
-│       ├── shell_exec.go          # shell_exec tool — handler, registration
-│       ├── shell_exec_test.go
+│       ├── bash.go                # bash tool — handler, registration
+│       ├── bash_test.go
 │       ├── session_end.go         # session_end tool — handler, registration
 │       └── session_end_test.go
 ├── docs/
@@ -847,6 +829,8 @@ mcp_servers:
       bearer_token: "{{.CLI_MCP_BEARER_TOKEN}}"
       timeout: 90
       verify_ssl: false
+      custom_headers:
+        X-Session-ID: "{{.SESSION_ID}}"  # Injected per-session by TARSy (investigation ID)
     instructions: |
       This server provides a sandboxed shell environment for cluster investigation.
       You have full bash access: pipes, redirects, chaining, and standard Unix tools (jq, grep, awk).
@@ -854,7 +838,6 @@ mcp_servers:
       Available clusters: rm1, rm2, rm3. Use --context=<cluster> to target a specific cluster.
       Your workspace at /workspace is ephemeral — use it for intermediate files during investigation.
       All cluster access is read-only via RBAC.
-      Always pass your investigation ID as session_id in every shell_exec call.
       Call session_end when your investigation is complete.
     data_masking:
       enabled: true
@@ -874,7 +857,7 @@ mcp_servers:
 | `pkg/session` | Pod creation, cache hit/miss, cleanup, stale detection | `client-go` fake clientset (`fake.NewSimpleClientset`) |
 | `pkg/agent` (client) | HTTP client for agent API — success, timeout, error | `httptest.NewServer` with canned responses |
 | `pkg/sandbox` | Bash session — command execution, exit codes, env persistence, crash recovery | Real `bash` process in test (short-lived) |
-| `pkg/tools` | `shell_exec` handler — session routing, truncation, error mapping | Mock `SessionManager` interface |
+| `pkg/tools` | `bash` handler — header extraction, session routing, error mapping | Mock `SessionManager` interface |
 | `pkg/server` | Tool registration, health check, middleware | In-memory server |
 
 ### Integration tests
@@ -897,7 +880,7 @@ Unit tests with fakes cover the critical paths. Integration tests with real sand
 2. Implement `pkg/session/cache.go` — in-memory pod IP cache with TTL
 3. Implement `pkg/session/manager.go` — pod lifecycle (create, discover, cleanup, stale)
 4. Implement `pkg/agent/client.go` — HTTP client for agent API
-5. Implement `pkg/tools/shell_exec.go` — tool handler, registration
+5. Implement `pkg/tools/bash.go` — tool handler, registration
 6. Implement `cmd/server/main.go` — Cobra root, server bootstrap
 7. Implement `pkg/server/server.go` — MCP server setup with middleware
 8. Write `Dockerfile.server`
@@ -923,9 +906,11 @@ Unit tests with fakes cover the critical paths. Integration tests with real sand
 
 | # | Topic | Decision | Rationale |
 |---|---|---|---|
-| Q1 | Session identification | Explicit `session_id` parameter in `shell_exec` | Server stays stateless (consistent with all MCP servers). Pod labels as source of truth. Any replica serves any request. TARSy passes its investigation ID. |
+| Q1 | Session identification | `X-Session-ID` HTTP header (injected by TARSy) | Server stays stateless. LLM never manages session IDs — eliminates hallucination/typo errors. Header travels with every request, works with any replica. MCP SDK's `RequestExtra.Header` provides first-class access. |
 | Q2 | Session cleanup | `session_end` tool (primary) + TTL safety net (fallback, 30m idle) | Immediate resource cleanup when LLM calls `session_end`. TTL catches edge cases (LLM crash, forgotten cleanup). Matches OpenHands pattern. |
 | Q3 | Pod template source | Hardcoded Go struct + CLI flags for overrides | Simplest approach, consistent with `mcp-server-devsandbox`. Variable parts (image, resources, namespace, timeout) exposed as flags. Can evolve to ConfigMap overrides later if needed. |
 | Q4 | Sandbox agent bash implementation | Pipe-based with delimiter protocol (stdin/stdout/stderr pipes, UUID delimiters) | Clean stdout/stderr separation for structured responses. No external dependencies. Well-known pattern (OpenHands, Claude Code). UUID delimiters prevent collisions. PTY adds complexity with no benefit for LLM consumption. |
+| Q5 | Tool naming | `bash` (not `shell_exec` or `exec`) | Matches Claude Code's `bash` tool — maximally familiar to LLMs. Avoids collision with `exec` (which in K8s/Docker means "attach to a running container"). |
+| Q6 | Output handling | Return as-is, no truncation | MCP server is a dumb proxy. Output treatment (masking, summarization) is TARSy's responsibility via existing per-server config. |
 
 **Note on future write capabilities:** If the server later adds write-capable CLIs (e.g., `helm install`, `oc apply`), per-cluster sandbox pods should be considered. With write access, targeting the wrong cluster has destructive consequences, and per-cluster isolation eliminates that risk. For read-only investigation, a shared kubeconfig with all contexts is safe.

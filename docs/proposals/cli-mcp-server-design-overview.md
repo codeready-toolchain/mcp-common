@@ -13,7 +13,7 @@
 A new MCP server that gives TARSy investigation agents a **sandboxed shell environment** — an isolated Kubernetes pod where the LLM has a persistent bash session with full CLI access. Think of it as giving the LLM the same capabilities a developer has in a terminal, but running inside a locked-down container.
 
 The server exposes two tools:
-- **`shell_exec`** — run any shell command in the sandbox
+- **`bash`** — run any shell command in the sandbox (named after Claude Code's `bash` tool — the pattern LLMs are most trained on)
 - **`session_end`** — clean up the sandbox when the investigation is done
 
 ## Why it exists
@@ -34,28 +34,28 @@ This server **complements** existing structured MCP servers — it doesn't repla
 
 ### The flow
 
-1. TARSy calls `shell_exec(command="oc get pods -n foo --context=rm1", session_id="inv-abc123")`
-2. The MCP server looks up the sandbox pod for session `inv-abc123` using Kubernetes labels
+1. TARSy calls `bash(command="oc get pods -n foo --context=rm1")` — the `X-Session-ID` header is automatically attached by TARSy's MCP client
+2. The MCP server extracts the session ID from the `X-Session-ID` HTTP header and looks up the sandbox pod using Kubernetes labels
 3. If no pod exists, it creates one and waits for it to be ready
 4. It sends the command to the sandbox agent via HTTP
 5. The agent pipes the command into the persistent bash process, captures stdout/stderr, and returns a structured JSON response (output, exit code, execution time)
-6. The MCP server truncates output if it exceeds 100KB and returns the result to TARSy
+6. The MCP server returns the result as-is to TARSy. Output treatment (summarization, masking) is TARSy's responsibility.
 
 ### Session lifecycle
 
-Each investigation gets its own sandbox pod. The pod is created on the first `shell_exec` call and persists for the duration of the investigation. Environment variables, working directory, and files persist between calls because the bash process stays alive.
+Each investigation gets its own sandbox pod. The pod is created on the first `bash` call and persists for the duration of the investigation. Environment variables, working directory, and files persist between calls because the bash process stays alive.
 
 When the investigation is done:
-- **Primary cleanup:** The LLM calls `session_end(session_id="inv-abc123")`, which immediately deletes the pod.
+- **Primary cleanup:** The LLM calls `session_end()`, which immediately deletes the pod. The MCP server identifies which pod to delete from the `X-Session-ID` header.
 - **Fallback cleanup:** A TTL safety net deletes pods that have been idle for 30 minutes, catching cases where the LLM crashes or forgets to clean up.
 
 ## Key design decisions
 
-### 1. Stateless server with explicit session routing
+### 1. Stateless server with header-based session routing
 
-The MCP server runs in **stateless mode**, consistent with all other MCP servers. Every `shell_exec` call includes a `session_id` parameter (typically the TARSy investigation ID). The server routes to the correct sandbox pod by looking up Kubernetes labels — no in-memory session tracking, no sticky sessions. Any server replica can handle any request.
+The MCP server runs in **stateless mode**, consistent with all other MCP servers. Session routing uses the `X-Session-ID` HTTP header, which TARSy injects automatically on every MCP request (typically set to the investigation ID). The server routes to the correct sandbox pod by looking up Kubernetes labels — no in-memory session tracking, no sticky sessions. Any server replica can handle any request.
 
-This was chosen over MCP SDK session management (stateful mode) because other MCP servers are stateless, and adding statefulness would require sticky sessions or shared state for multi-replica deployments.
+The session ID is **not** a tool parameter — the LLM never sees or manages it. This eliminates an entire class of errors (hallucinated IDs, typos, inconsistent values across calls) and keeps the tool schema minimal. TARSy's MCP client injects the header via a custom HTTP round-tripper, the same pattern used for bearer token injection.
 
 ### 2. Security from the sandbox boundary
 
@@ -66,7 +66,6 @@ There are no application-level command allowlists or blocklists. Security comes 
 - **Network isolation** — a NetworkPolicy restricts sandbox pods to only reach Kubernetes API servers. No internet access, no access to other services.
 - **Ephemeral storage** — the `/workspace` filesystem is an `emptyDir` volume that is destroyed when the pod is deleted. No data persists between investigations.
 - **Resource limits** — CPU/memory limits per sandbox pod prevent resource abuse.
-- **Output truncation** — command output is capped at 100KB to prevent token explosion.
 
 ### 3. Pipe-based bash session with delimiter protocol
 
@@ -82,16 +81,17 @@ The sandbox pod specification is built in Go code. Variable parts (container ima
 
 ```
 TARSy
-  ↓ (bearer token)
+  ↓ (bearer token + X-Session-ID header per request)
 kube-rbac-proxy (TLS :8443)
   ↓
 cli-mcp-server (:8080, stateless, N replicas)
-  ├── shell_exec handler
-  │     ├── Find sandbox pod by label (session_id)
+  ├── bash handler
+  │     ├── Extract session ID from X-Session-ID header
+  │     ├── Find sandbox pod by label (session ID)
   │     ├── Create pod if missing (client-go)
   │     └── Proxy command to sandbox agent (HTTP)
   ├── session_end handler
-  │     └── Delete sandbox pod by label
+  │     └── Delete sandbox pod by label (session ID from header)
   └── Stale pod cleanup (every 5 min, TTL 30 min)
        ↓ HTTP (pod IP:8090)
   Sandbox Pod (one per investigation, tarsy namespace)
@@ -107,33 +107,32 @@ cli-mcp-server (:8080, stateless, N replicas)
 
 ## MCP tools
 
-### `shell_exec`
+### `bash`
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `command` | string | yes | Shell command to execute (full bash — pipes, redirects, chaining) |
-| `session_id` | string | yes | Session identifier (typically the TARSy investigation ID) |
 | `timeout` | int | no | Max execution time in seconds (default 60, max 300) |
+
+Session routing is handled transparently via the `X-Session-ID` HTTP header — the LLM never needs to manage session identity.
 
 Example usage:
 
 ```
-shell_exec(command="oc get clusteroperators --context=rm1", session_id="inv-abc123")
+bash(command="oc get clusteroperators --context=rm1")
 
-shell_exec(command="oc get pods -n openshift-ingress --context=rm1 -o json | jq '.items[] | {name: .metadata.name, ready: .status.containerStatuses[0].ready}'", session_id="inv-abc123")
+bash(command="oc get pods -n openshift-ingress --context=rm1 -o json | jq '.items[] | {name: .metadata.name, ready: .status.containerStatuses[0].ready}'")
 
-shell_exec(command="diff <(oc get pods --context=rm1 -o name) <(oc get pods --context=rm2 -o name)", session_id="inv-abc123")
+bash(command="diff <(oc get pods --context=rm1 -o name) <(oc get pods --context=rm2 -o name)")
 
-shell_exec(command="export CTX=rm1; for ns in $(oc get ns --context=$CTX -o name | head -10); do echo \"=== $ns ===\"; oc get pods --context=$CTX -n ${ns#namespace/} --no-headers 2>/dev/null | wc -l; done", session_id="inv-abc123")
+bash(command="export CTX=rm1; for ns in $(oc get ns --context=$CTX -o name | head -10); do echo \"=== $ns ===\"; oc get pods --context=$CTX -n ${ns#namespace/} --no-headers 2>/dev/null | wc -l; done")
 ```
 
 Non-zero exit codes are returned as tool results (not MCP errors) — a command returning "NotFound" is still useful output for the LLM.
 
 ### `session_end`
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `session_id` | string | yes | Session to terminate |
+No parameters — the session ID is extracted from the `X-Session-ID` HTTP header, same as `bash`.
 
 Immediately deletes the sandbox pod and frees resources.
 
@@ -171,7 +170,7 @@ Adding a future CLI (e.g., `virtctl`, `helm`) means installing the binary in the
 
 ### TARSy configuration
 
-The server is added as an `mcp_servers` entry in `tarsy.yaml`. Agent instructions tell the LLM how to use the sandbox, which clusters are available, and to always pass the investigation ID as `session_id`.
+The server is added as an `mcp_servers` entry in `tarsy.yaml` with a `custom_headers` field that injects `X-Session-ID` per-session. Agent instructions tell the LLM how to use the sandbox and which clusters are available — the LLM doesn't need to know about session routing.
 
 ## Implementation phases
 
@@ -196,7 +195,8 @@ If the server later adds write-capable CLIs (e.g., `helm install`, `oc apply`), 
 
 | # | Topic | Decision | Rationale |
 |---|---|---|---|
-| 1 | Session identification | Explicit `session_id` parameter | Server stays stateless (consistent with all MCP servers). Pod labels as source of truth. Any replica serves any request. |
+| 1 | Session identification | `X-Session-ID` HTTP header (injected by TARSy) | Server stays stateless. LLM never manages session IDs — eliminates hallucination/typo errors. Header travels with every request, works with any replica. |
 | 2 | Session cleanup | `session_end` tool + TTL safety net (30m) | Immediate cleanup when LLM calls `session_end`. TTL catches edge cases (crash, forgotten cleanup). |
 | 3 | Pod template source | Hardcoded Go struct + CLI flags | Simplest approach, consistent with existing MCP servers. Can evolve to ConfigMap overrides later. |
 | 4 | Bash session management | Pipe-based with UUID delimiter protocol | Clean stdout/stderr separation. No external dependencies. Well-known pattern used by OpenHands and Claude Code. |
+| 5 | Tool naming | `bash` (not `shell_exec` or `exec`) | Matches Claude Code's `bash` tool — maximally familiar to LLMs. Avoids collision with `exec` (which in K8s/Docker means "attach to a running container"). |
