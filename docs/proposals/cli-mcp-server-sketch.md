@@ -119,10 +119,11 @@ TARSy
 kube-rbac-proxy (TLS :8443)
   ↓
 cli-mcp-server (:8080)  ← "control plane"
-  ├── /mcp       → MCP tool handlers (extract session ID from X-Session-ID header)
-  ├── /metrics   → Prometheus
-  ├── /live      → liveness
-  └── /health    → readiness
+  ├── /mcp            → MCP tool handlers (extract session ID from X-Session-ID header)
+  ├── /sessions/{id}  → DELETE: session cleanup (called by TARSy, not LLM)
+  ├── /metrics        → Prometheus
+  ├── /live           → liveness
+  └── /health         → readiness
        ↓
   Session Manager (client-go, tarsy namespace)
   ├── Extract session ID from X-Session-ID HTTP header
@@ -130,7 +131,7 @@ cli-mcp-server (:8080)  ← "control plane"
   ├── Discover sandbox pods by label (session-id)
   ├── Proxy shell commands to sandbox agent via HTTP (pod IP:8090)
   ├── Return structured response (stdout, stderr, exit code) to LLM
-  └── Cleanup pod on session end / TTL expiry
+  └── Cleanup pod via DELETE /sessions/{id} or TTL expiry
        ↓
   Sandbox Pod (one per investigation session, in tarsy namespace)
   ├── sandbox-agent (Go binary, HTTP :8090, manages persistent bash session)
@@ -150,7 +151,7 @@ cli-mcp-server (:8080)  ← "control plane"
 An ephemeral Kubernetes pod created for each investigation session. It contains:
 
 - **Sandbox agent** — a lightweight Go HTTP server (~200-300 lines) that manages a persistent bash session. The pod's entrypoint. Accepts commands via HTTP, returns structured JSON responses (stdout, stderr, exit code, execution time). This is the same pattern used by OpenHands (agent binary inside container).
-- **Pre-installed CLIs** — `oc`, `kubectl`, and future CLIs. The Dockerfile for the sandbox image controls what's available.
+- **Pre-installed CLIs** — `oc`, `kubectl`, and future CLIs. The Containerfile for the sandbox image controls what's available.
 - **Unix utilities** — `jq`, `yq`, `grep`, `awk`, `sort`, `wc`, `curl` (internal-only network). These make the LLM productive — it can pipe, filter, and transform output the same way a developer would.
 - **Ephemeral workspace** — `/workspace` is an `emptyDir` volume. The LLM can write intermediate files during an investigation. Everything is destroyed when the pod is deleted.
 - **Read-only kubeconfig** — mounted from a kubeconfig secret scoped to the dedicated investigation ServiceAccount. Contains contexts for all target clusters.
@@ -163,28 +164,43 @@ Adding a future CLI means installing the binary in the sandbox image. No server 
 The lightweight Go binary running inside each sandbox pod. It:
 
 1. Starts an HTTP server on a fixed port (e.g., `:8090`)
-2. On first request, spawns a persistent `bash` process
+2. Spawns a persistent `bash` process (on first `/exec` request, or on startup if assigned at pod creation)
 3. For each command request, pipes the command to bash's stdin, captures stdout/stderr
 4. Returns a structured JSON response: `{"stdout": "...", "stderr": "...", "exit_code": 0, "duration_ms": 123}`
 5. Maintains session state naturally — env vars, working directory, and aliases persist because the bash process stays alive
 6. Exposes a `/health` endpoint for readiness checks
+7. Exposes a `POST /assign` endpoint — accepts the auth token, transitions the agent from "unassigned" to "assigned" mode. Can only be called once. Required for warm pool pods; for pods created on demand, the token is delivered via `secretKeyRef` env var and `/assign` is not needed.
 
-The agent is simple by design. It doesn't implement security filtering, cluster resolution, or output truncation — those concerns belong in the MCP server or the sandbox boundary. The agent just runs commands and returns results.
+The agent is simple by design. It doesn't implement security filtering or cluster resolution — those concerns belong in the MCP server or the sandbox boundary. The agent just runs commands and returns results.
 
 ### Session manager
 
 The component inside `cli-mcp-server` that manages sandbox pod lifecycle:
 
-1. **Create** — on first `bash` call for a session, creates a sandbox pod from a pod template via `client-go` in the `tarsy` namespace. Labels the pod with the session ID extracted from the `X-Session-ID` HTTP header (set by TARSy, typically the investigation ID) and creation timestamp. Records the pod IP from the pod status for agent communication. See [Session routing via HTTP header](#session-routing-via-http-header) for how the session ID reaches the MCP server.
+1. **Assign or create** — on first `bash` call for a session, assigns an available warm pod from the pool (if warm pool is enabled and a pod is available) or creates a new sandbox pod from a pod template via `client-go`. Labels the pod with the session ID extracted from the `X-Session-ID` HTTP header (set by TARSy, typically the investigation ID). Delivers the per-session HMAC auth token to the agent via `POST /assign`. Records the pod IP for agent communication. See [Session routing via HTTP header](#session-routing-via-http-header) for how the session ID reaches the MCP server.
 2. **Discover** — finds sandbox pods by label. Uses an in-memory cache (TTL ~30s) to avoid per-request K8s API calls. On MCP server restart, rediscovers all active sandbox pods by label in a single list call and rebuilds the pod IP cache.
 3. **Execute** — sends the shell command to the sandbox agent's HTTP API (`http://<pod-ip>:8090/exec`) and returns the structured response as-is. Output treatment (summarization, masking) is TARSy's responsibility, not the MCP server's.
-4. **Cleanup** — deletes the sandbox pod when the session ends (TARSy signals completion) or the TTL expires (idle timeout). If the sandbox agent crashes, the pod restarts (standard K8s restart policy) and a new bash session begins — the MCP server detects this via the agent's `/health` endpoint and informs the LLM that session state was reset.
+4. **Cleanup** — deletes the sandbox pod and its auth Secret when TARSy calls `DELETE /sessions/{id}` (a plain HTTP endpoint, not an MCP tool) or the TTL expires (idle timeout). Session lifecycle is managed by TARSy, not the LLM. If the sandbox agent crashes, the pod restarts (standard K8s restart policy) and a new bash session begins — the MCP server detects this via the agent's `/health` endpoint and informs the LLM that session state was reset.
+5. **Replenish pool** — when a warm pod is assigned to a session, a background goroutine creates a replacement to maintain the configured pool size.
 
 Pod labels are the source of truth for session→pod mapping. The session ID is provided by TARSy via an HTTP header on every request — the LLM never sees or manages it. This keeps the MCP server stateless — any replica can serve any request, and restarts don't lose session routing.
 
+### Warm pod pool
+
+An optional pool of pre-created sandbox pods that are ready to be assigned to sessions immediately, eliminating cold start latency (pod scheduling, image pull, container startup, bash process initialization).
+
+Configured via `--warm-pool-size N` (default 0 = disabled). When enabled:
+
+- **Warm pods** are created without a session ID label and without an auth token. The sandbox agent starts in "unassigned" mode — `/health` returns 200, `/exec` returns 503.
+- **Assignment** is atomic: the session manager picks a warm pod, creates the per-session auth Secret, calls `POST /assign` on the agent (delivering the auth token), and patches the pod labels to add the session ID.
+- **Replenishment** is asynchronous — after a warm pod is assigned, a background reconciler creates a replacement to maintain the target pool size.
+- **Multiple MCP server replicas** coordinate via Kubernetes labels: each replica lists unassigned pods and attempts to claim one by patching its session ID label. The first patch wins; concurrent attempts fail gracefully and retry with a different pod.
+
+When the pool is exhausted or disabled (`--warm-pool-size 0`), the session manager falls back to creating pods on demand — the current behavior.
+
 ### MCP tool: `bash`
 
-Named after Claude Code's `bash` tool — the pattern LLMs are most trained on. The name avoids collision with `exec` (which in K8s/Docker means "attach to a running container") and accurately describes the sandbox: a persistent bash process.
+The name `bash` is the most common tool name for shell execution across LLM agent frameworks, making it immediately recognizable. It avoids collision with `exec` (which in K8s/Docker means "attach to a running container") and accurately describes the sandbox: a persistent bash process.
 
 A single MCP tool that gives the LLM full bash access in the sandbox:
 
@@ -227,7 +243,15 @@ This SA explicitly **does not** include `pods/exec` or KubeVirt lifecycle permis
 
 Each investigation gets its own sandbox pod. No cross-session filesystem access. No shared state between investigations.
 
-### Layer 3: Network isolation
+### Layer 3: Agent authentication (HMAC token)
+
+NetworkPolicy alone is not sufficient — CNI bugs, misconfigurations, or a compromised pod in the same namespace could bypass it. As defense-in-depth, the sandbox agent requires a bearer token on every request.
+
+The token is derived deterministically using HMAC: `token = HMAC-SHA256(shared_secret, session_id)`. All MCP server replicas share the same HMAC key (a single Kubernetes Secret). At pod creation, the MCP server computes the token, stores it in a per-session Kubernetes Secret, and the sandbox pod reads it via `secretKeyRef` — keeping the token out of the pod spec. At command execution, any replica computes the same token from the session ID (available in the `X-Session-ID` header) and includes it in the HTTP request to the agent. The sandbox agent verifies the token on every `/exec` request.
+
+This is fully stateless — no token lookup, no shared database. Same input always produces the same token.
+
+### Layer 4: Network isolation
 
 A `NetworkPolicy` on sandbox pods enforces:
 - **Ingress:** allow only from `cli-mcp-server` pods (so the MCP server can reach the sandbox agent's HTTP port)
@@ -235,11 +259,11 @@ A `NetworkPolicy` on sandbox pods enforces:
 
 This prevents data exfiltration, limits blast radius, and ensures sandbox pods are only reachable by the MCP server.
 
-### Layer 4: Ephemeral storage
+### Layer 5: Ephemeral storage
 
 The `/workspace` filesystem is an `emptyDir` — it dies with the pod. No persistent state between investigations. No data leakage across sessions.
 
-### Layer 5: Resource limits and TTL
+### Layer 6: Resource limits and TTL
 
 - **Resource limits** — CPU/memory limits per sandbox pod prevent resource abuse
 - **TTL** — pods auto-deleted after configurable idle timeout (e.g., 30 minutes)
@@ -303,6 +327,14 @@ The `custom_headers` field is a new addition to TARSy's transport config. Header
 
 Added to investigation agents that benefit from flexible CLI access. Which agents get access is a TARSy configuration decision — the `mcp_servers` list per agent in `tarsy.yaml`. The server has no knowledge of which agent is calling it.
 
+### Required TARSy changes
+
+This MCP server depends on two TARSy capabilities that don't exist yet:
+
+1. **`custom_headers` in `TransportConfig`** — TARSy's `config.TransportConfig` struct needs a new `CustomHeaders map[string]string` field. Headers with template variables (like `{{.SESSION_ID}}`) must be resolved per-session, not at config load time. This requires changes to `config.TransportConfig`, `mcp.createHTTPTransport`, and `mcp.ClientFactory` — the factory must accept per-session template variables and create HTTP clients with a round-tripper that injects the resolved headers (the same pattern used for bearer token injection).
+
+2. **Session cleanup HTTP call** — After an investigation chain completes, TARSy needs to call `DELETE /sessions/{id}` on the MCP server. Today, TARSy only communicates with MCP servers via the MCP protocol (`ClientFactory` → `Client`). Calling a plain REST endpoint requires a separate HTTP client constructed from the same transport config (URL base, bearer token, TLS settings). This is a new code path in the session executor. As a fallback, the TTL safety net on the MCP server handles cleanup even if TARSy doesn't call DELETE — so this integration can be deferred to a follow-up if needed.
+
 ## Technology
 
 - **Go** — consistent with all existing MCP servers
@@ -323,5 +355,4 @@ Both deployed in the `tarsy` namespace.
 - **Write/mutate operations against clusters** — read-only investigation by design (RBAC-enforced)
 - **Interactive commands requiring stdin** — no `oc edit`, no interactive `oc exec -it`
 - **Multi-tenancy / per-user credentials** — uses shared kubeconfig (per-user auth is a separate proposal)
-- **Warm pod pools** — can be added later if cold start latency is a problem in practice
 - **Custom output parsing** — the server returns raw shell output; TARSy's summarization handles compression
