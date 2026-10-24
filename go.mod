@@ -2,7 +2,7 @@ module github.com/codeready-toolchain/mcp-common
 
 go 1.26
 
-toolchain go1.26.5
+toolchain go1.26.10
 
 require (
 	github.com/modelcontextprotocol/go-sdk v1.4.1
