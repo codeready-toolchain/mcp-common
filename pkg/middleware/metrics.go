@@ -23,7 +23,8 @@ func NewMetricsMiddleware(serverName string, logger *slog.Logger) mcp.Middleware
 				tool = p.Name
 			}
 			success := err == nil
-			if r, ok := result.(*mcp.CallToolResult); ok {
+			// result can be a typed nil *CallToolResult when err != nil
+			if r, ok := result.(*mcp.CallToolResult); ok && r != nil {
 				logger.Debug("metrics-middleware: call tool result", "is-error", r.IsError)
 				success = success && !r.IsError
 			}
