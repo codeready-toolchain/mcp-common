@@ -75,6 +75,35 @@ func TestNewMetricsMiddleware(t *testing.T) {
 		assert.InDelta(t, float64(1), testutil.ToFloat64(failCounter)-before, 0)
 	})
 
+	t.Run("records failure when next handler returns a nil CallToolResult with an error", func(t *testing.T) {
+		// given
+		// the SDK passes a typed nil *CallToolResult with the error, e.g. when the
+		// tool arguments fail schema validation or the tool handler returns an error
+		failCounter := metrics.MCPCallsTotal.WithLabelValues("test-server", "tools/call", "nil-result-tool", "false")
+		before := testutil.ToFloat64(failCounter)
+
+		next := func(_ context.Context, _ string, _ mcp.Request) (mcp.Result, error) {
+			var result *mcp.CallToolResult
+			return result, errors.New("invalid params")
+		}
+
+		req := &mcp.ServerRequest[*mcp.CallToolParamsRaw]{
+			Session: &mcp.ServerSession{},
+			Params: &mcp.CallToolParamsRaw{
+				Name: "nil-result-tool",
+			},
+		}
+
+		handler := middleware.NewMetricsMiddleware("test-server", logger)(next)
+
+		// when
+		_, err := handler(context.Background(), "tools/call", req)
+
+		// then
+		require.Error(t, err)
+		assert.InDelta(t, float64(1), testutil.ToFloat64(failCounter)-before, 0)
+	})
+
 	t.Run("records failure when CallToolResult has IsError true", func(t *testing.T) {
 		// given
 		failCounter := metrics.MCPCallsTotal.WithLabelValues("test-server", "tools/call", "is-error-tool", "false")
